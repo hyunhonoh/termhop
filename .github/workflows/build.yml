@@ -13,12 +13,12 @@ jobs:
   windows:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: cargo test --locked
       - run: cargo build --release --locked
 
       # Downloadable from the Actions run page (sign-in required, kept 90 days).
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: termhop-windows-x64
           path: target/release/termhop.exe
@@ -31,7 +31,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Check tag matches Cargo.toml version
         run: |
           version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
@@ -39,7 +39,7 @@ jobs:
             echo "Tag $GITHUB_REF_NAME does not match Cargo.toml version $version" >&2
             exit 1
           fi
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: termhop-windows-x64
       - name: Publish
