@@ -1,0 +1,18 @@
+[package]
+name = "termhop"
+version = "0.1.0"
+edition = "2021"
+description = "Take PuTTY-style launch arguments and open the session as a tab in WezTerm or Windows Terminal (via plink)"
+license = "MIT"
+repository = "https://github.com/hyunhonoh/termhop"
+readme = "README.md"
+publish = false
+
+[dependencies]
+
+[profile.release]
+opt-level = "z"
+lto = true
+strip = true
+codegen-units = 1
+panic = "abort"

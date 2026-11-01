@@ -1,0 +1,55 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo test --locked
+      - run: cargo build --release --locked
+
+      # Downloadable from the Actions run page (sign-in required, kept 90 days).
+      - uses: actions/upload-artifact@v4
+        with:
+          name: termhop-windows-x64
+          path: target/release/termhop.exe
+
+  # Tag push (v*): publish a GitHub Release with the exe attached.
+  release:
+    needs: windows
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check tag matches Cargo.toml version
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "Tag $GITHUB_REF_NAME does not match Cargo.toml version $version" >&2
+            exit 1
+          fi
+      - uses: actions/download-artifact@v4
+        with:
+          name: termhop-windows-x64
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          f="termhop-${GITHUB_REF_NAME}-windows-x64.exe"
+          mv termhop.exe "$f"
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" "$f" --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" "$f" --title "termhop $GITHUB_REF_NAME" --generate-notes
+          fi
