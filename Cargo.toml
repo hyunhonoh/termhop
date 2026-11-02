@@ -1,6 +1,6 @@
 [package]
 name = "termhop"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Take PuTTY-style launch arguments and open the session as a tab in WezTerm or Windows Terminal (via plink)"
 license = "MIT"

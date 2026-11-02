@@ -46,6 +46,9 @@ PuTTY를 실행하도록 되어 있는 런처(웹 접속 버튼, 접속 관리 �
   ```lua
   config.exit_behavior = "CloseOnCleanExit"
   ```
+- **탭이 열렸다가 바로 닫히면**: 위 설정을 넣고 다시 접속해 메시지를 확인하세요.
+  `unknown option "-no-antispoof"`가 보이면 plink가 0.71보다 오래된 것입니다.
+  `winget upgrade PuTTY.PuTTY`로 업데이트하거나, 설정에 `access_prompt = on`을 적으세요.
 
 ## 설정 (선택)
 
@@ -55,6 +58,10 @@ PuTTY를 실행하도록 되어 있는 런처(웹 접속 버튼, 접속 관리 �
 ```ini
 # wezterm(기본) 또는 wt
 terminal = wezterm
+
+# 로그인 뒤 "Press Return to begin session"에서 Enter를 눌러야 세션이 시작되게 하려면 on
+# (기본 off: PuTTY처럼 바로 들어갑니다)
+# access_prompt = on
 
 # 자동으로 못 찾을 때만 경로를 적습니다
 # plink = C:\Program Files\PuTTY\plink.exe

@@ -14,6 +14,9 @@ use crate::config::{Config, Terminal};
 /// Flags that already choose a protocol (or a saved session that carries one).
 const PROTOCOL_FLAGS: &[&str] = &["-ssh", "-ssh-connection", "-telnet", "-rlogin", "-raw", "-serial", "-load"];
 
+/// plink flag that skips the "Access granted. Press Return to begin session." prompt.
+const NO_ACCESS_PROMPT: &str = "-no-antispoof";
+
 /// How long to wait for `wezterm cli spawn` before giving up on the running window.
 const SPAWN_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -48,6 +51,11 @@ pub fn plan(cfg: &Config, plink_args: &[String]) -> Result<Vec<Step>, String> {
         "plink를 찾지 못했습니다.\nPuTTY를 설치하거나 termhop.conf에 `plink = <경로>`를 적어 주세요.",
     )?;
     let mut command = vec![plink.to_string_lossy().into_owned()];
+    // A PuTTY window goes straight into the session after an automatic login; plink
+    // instead waits for Return at "Access granted" unless told not to.
+    if !cfg.access_prompt && !plink_args.iter().any(|a| a == NO_ACCESS_PROMPT) {
+        command.push(NO_ACCESS_PROMPT.to_string());
+    }
     command.extend(plink_args.iter().cloned());
 
     Ok(match cfg.terminal {
@@ -296,10 +304,22 @@ mod tests {
         let steps = plan(&cfg, &s(&["-ssh", "host"])).unwrap();
         let p = exe.to_string_lossy().into_owned();
         assert_eq!(steps.len(), 2);
-        assert_eq!(steps[0].args, s(&["cli", "--no-auto-start", "spawn", "--", &p, "-ssh", "host"]));
+        assert_eq!(steps[0].args, s(&["cli", "--no-auto-start", "spawn", "--", &p, "-no-antispoof", "-ssh", "host"]));
         assert!(steps[0].wait);
-        assert_eq!(steps[1].args, s(&["start", "--", &p, "-ssh", "host"]));
+        assert_eq!(steps[1].args, s(&["start", "--", &p, "-no-antispoof", "-ssh", "host"]));
         assert!(!steps[1].wait);
+    }
+
+    #[test]
+    fn access_prompt_flag_follows_settings() {
+        let exe = existing();
+        let base = Config { plink: Some(exe.clone()), wezterm: Some(exe.clone()), ..Config::default() };
+        let count = |cfg: &Config, args: &[&str]| {
+            plan(cfg, &s(args)).unwrap()[0].args.iter().filter(|a| *a == "-no-antispoof").count()
+        };
+        assert_eq!(count(&base, &["host"]), 1);
+        assert_eq!(count(&base, &["-no-antispoof", "host"]), 1);
+        assert_eq!(count(&Config { access_prompt: true, ..base.clone() }, &["host"]), 0);
     }
 
     #[test]
@@ -381,7 +401,7 @@ mod tests {
         let steps = plan(&cfg, &s(&["-ssh", "-pw", "a;b", "host"])).unwrap();
         assert_eq!(steps.len(), 1);
         assert_eq!(steps[0].args[..4], s(&["-w", "0", "new-tab", "--"]));
-        assert_eq!(steps[0].args[5..], s(&["-ssh", "-pw", r"a\;b", "host"]));
+        assert_eq!(steps[0].args[5..], s(&["-no-antispoof", "-ssh", "-pw", r"a\;b", "host"]));
     }
 
     #[cfg(unix)]

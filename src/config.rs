@@ -23,11 +23,14 @@ pub struct Config {
     pub plink: Option<PathBuf>,
     pub wezterm: Option<PathBuf>,
     pub wt: Option<PathBuf>,
+    /// Keep plink's "Access granted. Press Return to begin session." prompt.
+    /// Off by default, matching how a PuTTY window goes straight into the session.
+    pub access_prompt: bool,
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Config { terminal: Terminal::WezTerm, plink: None, wezterm: None, wt: None }
+        Config { terminal: Terminal::WezTerm, plink: None, wezterm: None, wt: None, access_prompt: false }
     }
 }
 
@@ -96,6 +99,15 @@ pub fn parse(text: &str) -> Result<Config, String> {
             "plink" => cfg.plink = Some(PathBuf::from(value)),
             "wezterm" => cfg.wezterm = Some(PathBuf::from(value)),
             "wt" => cfg.wt = Some(PathBuf::from(value)),
+            "access_prompt" => {
+                cfg.access_prompt = match value.to_ascii_lowercase().as_str() {
+                    "on" | "true" | "yes" => true,
+                    "off" | "false" | "no" => false,
+                    other => {
+                        return Err(format!("{n}번째 줄: access_prompt 값 `{other}` 은(는) 쓸 수 없습니다 (on 또는 off)."))
+                    }
+                }
+            }
             other => return Err(format!("{n}번째 줄: 알 수 없는 항목 `{other}`")),
         }
     }
@@ -143,6 +155,14 @@ mod tests {
         let cfg = parse("plink = C:\\Tools\\C#\\plink.exe # note\nwezterm = \"D:\\a #b\\wezterm.exe\"").unwrap();
         assert_eq!(cfg.plink, Some(PathBuf::from("C:\\Tools\\C#\\plink.exe")));
         assert_eq!(cfg.wezterm, Some(PathBuf::from("D:\\a #b\\wezterm.exe")));
+    }
+
+    #[test]
+    fn reads_access_prompt_switch() {
+        assert!(!Config::default().access_prompt);
+        assert!(parse("access_prompt = on").unwrap().access_prompt);
+        assert!(!parse("access_prompt = OFF").unwrap().access_prompt);
+        assert!(parse("access_prompt = maybe").is_err());
     }
 
     #[test]
