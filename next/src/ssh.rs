@@ -3,18 +3,14 @@
 //! The UI thread talks to it through two channels: [`Cmd`] in (keystrokes, resizes)
 //! and [`Event`] out (server output, notices, questions for the user).
 
-use std::path::PathBuf;
 use std::sync::Arc;
 
-use russh::client::{self, KeyboardInteractiveAuthResponse};
+use russh::client::{self, AuthResult, KeyboardInteractiveAuthResponse};
 use russh::keys::{self, HashAlg, PublicKeyOrCertificate};
-use russh::{cipher, kex, mac, ChannelMsg, Disconnect, Preferred};
+use russh::{cipher, kex, mac, ChannelMsg, Disconnect, MethodKind, Preferred};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::args::Target;
-
-/// What the server is told the terminal is. PuTTY sends the same.
-const TERM: &str = "xterm";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Size {
@@ -40,20 +36,23 @@ pub enum Event {
 
 type Events = mpsc::UnboundedSender<Event>;
 
+/// `term` is the terminal type announced to the server (`xterm` by default, as PuTTY does).
 pub fn spawn(
     rt: &tokio::runtime::Handle,
     target: Target,
+    term: String,
     events: Events,
     cmds: mpsc::UnboundedReceiver<Cmd>,
 ) {
     rt.spawn(async move {
-        let reason = session(target, &events, cmds).await.unwrap_or_else(|e| e);
+        let reason = session(target, &term, &events, cmds).await.unwrap_or_else(|e| e);
         let _ = events.send(Event::Closed(reason));
     });
 }
 
 async fn session(
     target: Target,
+    term: &str,
     events: &Events,
     mut cmds: mpsc::UnboundedReceiver<Cmd>,
 ) -> Result<String, String> {
@@ -85,14 +84,31 @@ async fn session(
 
     let channel = handle.channel_open_session().await.map_err(|e| format!("세션을 열지 못했습니다: {e}"))?;
     channel
-        .request_pty(false, TERM, size.cols.into(), size.rows.into(), size.width_px, size.height_px, &[])
+        .request_pty(false, term, size.cols.into(), size.rows.into(), size.width_px, size.height_px, &[])
         .await
         .map_err(|e| format!("터미널을 요청하지 못했습니다: {e}"))?;
     channel.request_shell(true).await.map_err(|e| format!("셸을 시작하지 못했습니다: {e}"))?;
 
+    // Writes wait for the server's receive window, which only opens while incoming
+    // data keeps being read. So writing happens in its own task, never in the read loop.
     let (mut reader, writer) = channel.split();
+    let (to_writer, mut outgoing) = mpsc::unbounded_channel::<Cmd>();
+    tokio::spawn(async move {
+        while let Some(cmd) = outgoing.recv().await {
+            match cmd {
+                Cmd::Input(bytes) => {
+                    if writer.data(&bytes[..]).await.is_err() {
+                        break;
+                    }
+                }
+                Cmd::Resize(s) => {
+                    let _ = writer.window_change(s.cols.into(), s.rows.into(), s.width_px, s.height_px).await;
+                }
+            }
+        }
+    });
     if !early_input.is_empty() {
-        writer.data(&early_input[..]).await.map_err(|e| format!("보내지 못했습니다: {e}"))?;
+        let _ = to_writer.send(Cmd::Input(early_input));
     }
 
     let mut exit_status = None;
@@ -109,11 +125,8 @@ async fn session(
                 _ => {}
             },
             cmd = cmds.recv() => match cmd {
-                Some(Cmd::Input(bytes)) => {
-                    writer.data(&bytes[..]).await.map_err(|e| format!("보내지 못했습니다: {e}"))?;
-                }
-                Some(Cmd::Resize(s)) => {
-                    let _ = writer.window_change(s.cols.into(), s.rows.into(), s.width_px, s.height_px).await;
+                Some(cmd) => {
+                    let _ = to_writer.send(cmd);
                 }
                 // The window was closed.
                 None => {
@@ -130,7 +143,8 @@ async fn session(
     })
 }
 
-/// Password first (what `-pw` means in PuTTY), then keyboard-interactive, then ask.
+/// Password first (what `-pw` means in PuTTY), then whatever the server says it
+/// still accepts: keyboard-interactive or password, asking in the terminal.
 async fn authenticate(
     handle: &mut client::Handle<Client>,
     user: &str,
@@ -139,49 +153,75 @@ async fn authenticate(
     events: &Events,
 ) -> Result<(), String> {
     let failed = |e: russh::Error| format!("로그인 중 오류: {e}");
+    // Empty means "not told yet": try keyboard-interactive, then password.
+    let mut allowed: Vec<MethodKind> = Vec::new();
 
     if let Some(pw) = &password {
-        if handle.authenticate_password(user, pw).await.map_err(failed)?.success() {
-            return Ok(());
-        }
-    }
-
-    // Some servers only offer keyboard-interactive. The given password answers
-    // the first hidden prompt; anything else is asked in the terminal.
-    let mut unused_password = password;
-    let mut response = handle.authenticate_keyboard_interactive_start(user, None).await.map_err(failed)?;
-    loop {
-        match response {
-            KeyboardInteractiveAuthResponse::Success => return Ok(()),
-            KeyboardInteractiveAuthResponse::Failure { .. } => break,
-            KeyboardInteractiveAuthResponse::InfoRequest { name, instructions, prompts } => {
-                for text in [name, instructions] {
-                    if !text.is_empty() {
-                        notice(events, text);
-                    }
+        match handle.authenticate_password(user, pw).await.map_err(failed)? {
+            AuthResult::Success => return Ok(()),
+            AuthResult::Failure { remaining_methods, .. } => {
+                allowed = remaining_methods.to_vec();
+                // Keyboard-interactive will still try the same password; only say so when it won't.
+                if !allowed.contains(&MethodKind::KeyboardInteractive) {
+                    notice(events, "전달받은 비밀번호(-pw)로 로그인하지 못했습니다.");
                 }
-                let mut answers = Vec::with_capacity(prompts.len());
-                for prompt in prompts {
-                    let answer = match (prompt.echo, unused_password.take()) {
-                        (false, Some(pw)) => pw,
-                        (_, pw) => {
-                            unused_password = pw;
-                            ask(events, prompt.prompt, prompt.echo).await.ok_or("로그인을 취소했습니다.")?
-                        }
-                    };
-                    answers.push(answer);
-                }
-                response = handle.authenticate_keyboard_interactive_respond(answers).await.map_err(failed)?;
             }
         }
     }
 
-    for _ in 0..3 {
-        let pw = ask(events, format!("{user}@{host}'s password: "), false).await.ok_or("로그인을 취소했습니다.")?;
-        if handle.authenticate_password(user, pw).await.map_err(failed)?.success() {
-            return Ok(());
+    // The given password answers the first hidden keyboard-interactive prompt.
+    let mut unused_password = password;
+    for attempt in 0..3 {
+        if attempt > 0 {
+            notice(events, "로그인하지 못했습니다. 다시 입력해 주세요.");
         }
-        notice(events, "비밀번호가 맞지 않습니다.");
+        let mut asked = false;
+        if allowed.is_empty() || allowed.contains(&MethodKind::KeyboardInteractive) {
+            let mut response = handle.authenticate_keyboard_interactive_start(user, None).await.map_err(failed)?;
+            loop {
+                match response {
+                    KeyboardInteractiveAuthResponse::Success => return Ok(()),
+                    KeyboardInteractiveAuthResponse::Failure { remaining_methods, .. } => {
+                        allowed = remaining_methods.to_vec();
+                        break;
+                    }
+                    KeyboardInteractiveAuthResponse::InfoRequest { name, instructions, prompts } => {
+                        for text in [name, instructions] {
+                            if !text.is_empty() {
+                                notice(events, text);
+                            }
+                        }
+                        let mut answers = Vec::with_capacity(prompts.len());
+                        for prompt in prompts {
+                            let answer = match (prompt.echo, unused_password.take()) {
+                                (false, Some(pw)) => pw,
+                                (_, pw) => {
+                                    unused_password = pw;
+                                    asked = true;
+                                    ask(events, prompt.prompt, prompt.echo).await.ok_or("로그인을 취소했습니다.")?
+                                }
+                            };
+                            answers.push(answer);
+                        }
+                        response = handle.authenticate_keyboard_interactive_respond(answers).await.map_err(failed)?;
+                    }
+                }
+            }
+        }
+        // Don't ask twice in one round when the server took a keyboard-interactive answer.
+        if asked && allowed.contains(&MethodKind::KeyboardInteractive) {
+            continue;
+        }
+        if allowed.contains(&MethodKind::Password) {
+            let pw = ask(events, format!("{user}@{host}'s password: "), false).await.ok_or("로그인을 취소했습니다.")?;
+            match handle.authenticate_password(user, pw).await.map_err(failed)? {
+                AuthResult::Success => return Ok(()),
+                AuthResult::Failure { remaining_methods, .. } => allowed = remaining_methods.to_vec(),
+            }
+        } else if !allowed.contains(&MethodKind::KeyboardInteractive) {
+            let names: Vec<&str> = allowed.iter().map(<&str>::from).collect();
+            return Err(format!("서버가 허용하는 로그인 방식({})은 아직 지원하지 않습니다.", names.join(", ")));
+        }
     }
     Err("로그인하지 못했습니다.".into())
 }
@@ -218,7 +258,7 @@ impl client::Handler for Client {
             notice(&self.events, "서버가 인증서로 신원을 밝혔지만, 인증서 확인은 아직 지원하지 않습니다.");
             return Ok(false);
         };
-        let Some(path) = known_hosts_path() else {
+        let Some(path) = crate::config::user_config_dir().map(|d| d.join("known_hosts")) else {
             notice(&self.events, "서버 키를 저장할 폴더를 찾지 못했습니다.");
             return Ok(false);
         };
@@ -236,13 +276,17 @@ impl client::Handler for Client {
                 );
                 Ok(false)
             }
-            _ => {
+            other => {
+                if let Err(e) = &other {
+                    notice(&self.events, format!("서버 키 기록({})을 읽지 못했습니다: {e}", path.display()));
+                }
                 let question = format!(
                     "처음 접속하는 서버입니다. 서버 키:\r\n  {} {fingerprint}\r\n이 키를 저장하고 접속할까요? (y/n) ",
                     key.algorithm()
                 );
                 let yes = ask(&self.events, question, true).await.is_some_and(|a| a.trim().eq_ignore_ascii_case("y"));
-                if yes {
+                // Don't append to a file we couldn't read.
+                if yes && other.is_ok() {
                     if let Err(e) = keys::known_hosts::learn_known_hosts_path(&self.host, self.port, key, &path) {
                         notice(&self.events, format!("서버 키를 저장하지 못했습니다 ({e}). 이번 접속만 계속합니다."));
                     }
@@ -251,18 +295,6 @@ impl client::Handler for Client {
             }
         }
     }
-}
-
-/// Our own known_hosts, separate from OpenSSH's, in the same folder as termhop.conf.
-fn known_hosts_path() -> Option<PathBuf> {
-    let base = if cfg!(windows) {
-        std::env::var_os("APPDATA").map(PathBuf::from)
-    } else {
-        std::env::var_os("XDG_CONFIG_HOME")
-            .map(PathBuf::from)
-            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
-    }?;
-    Some(base.join("termhop").join("known_hosts"))
 }
 
 fn notice(events: &Events, text: impl Into<String>) {

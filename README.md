@@ -35,9 +35,11 @@ termhop-next는 이 중간 단계를 없앤 **창 하나짜리 SSH 터미널**�
   - 인증 순서: 비밀번호(`-pw`) → keyboard-interactive → 터미널에서 직접 입력(최대 3회)
   - 서버 키: `%APPDATA%\termhop\known_hosts`에 저장. 처음 보는 서버는 지문을 보여 주고 `y`를 받아야 접속
   - 서버에 알리는 터미널 종류: `xterm` (PuTTY와 같음)
+- `config.rs` — `next.conf`(글꼴, 크기, 터미널 종류, 스크롤백, 색)
 - `term.rs` — libghostty-vt 화면을 GPUI로 그리기, 키보드·마우스·IME 처리
   - 같은 모양의 ASCII는 한 줄로 묶어 그리고, 한글·기호는 칸마다 따로 그려 대체 글꼴의 폭 차이 때문에 뒤 글자가 밀리지 않게 함
   - Enter·방향키·Ctrl 조합은 libghostty의 키 인코더로 보내고, 글자 입력은 IME를 거쳐 보냄
+  - 프로그램이 마우스를 요청하면 libghostty의 마우스 인코더로 클릭·드래그·휠을 보냄(SGR 등 프로그램이 고른 형식)
 
 ## 시험판 받기
 
@@ -67,6 +69,9 @@ termhop-next.exe -l 사용자 -pw 비밀번호 -P 22 서버주소
 - [ ] 드래그로 선택하면 복사, 오른쪽 클릭으로 붙여넣기
 - [ ] 서버에서 OSC 52로 보낸 텍스트가 PC 클립보드에 들어오는지
   (`printf "\033]52;c;$(printf hello | base64)\a"` 실행 후 메모장에 붙여넣기)
+- [ ] 마우스를 쓰는 프로그램(`tmux`의 `set -g mouse on`, `vim`의 `:set mouse=a`)에서 클릭·드래그·휠이 그 프로그램으로 가는지,
+  Shift를 누른 채 드래그하면 termhop 쪽 선택·복사가 되는지
+- [ ] `next.conf`로 글꼴·크기·색을 바꿔 보기(아래 "설정")
 
 ### 조작
 
@@ -75,12 +80,40 @@ termhop-next.exe -l 사용자 -pw 비밀번호 -P 22 서버주소
 | 복사 | 드래그(놓으면 복사), `Ctrl+Shift+C` |
 | 붙여넣기 | 오른쪽 클릭, `Ctrl+Shift+V`, `Shift+Insert` |
 | 스크롤백 | 마우스 휠(전체 화면 프로그램 밖에서) |
-| 글꼴 바꾸기 | 환경 변수 `TERMHOP_FONT`(기본 Consolas), `TERMHOP_FONT_SIZE`(기본 14) |
+| 마우스를 쓰는 프로그램 안에서 선택·붙여넣기 | `Shift`를 누른 채 드래그 / 오른쪽 클릭 |
+| 창 닫기 | 창의 X. 세션이 끝난 뒤에는 아무 키나 |
+
+프로그램이 마우스를 요청하면(tmux 마우스 모드, `vim`의 `mouse=a` 등) 클릭·드래그·휠은 그 프로그램으로 갑니다.
+그 프로그램이 복사한 내용은 OSC 52로 PC 클립보드에 들어옵니다(tmux는 `set -g set-clipboard on`).
+
+## 설정 (선택)
+
+`termhop-next.exe`와 같은 폴더, 또는 `%APPDATA%\termhop\`에 `next.conf`를 **UTF-8**로 저장합니다.
+1단계의 `termhop.conf`와는 다른 파일입니다. 모든 항목은 생략할 수 있습니다.
+
+```ini
+# 글꼴과 크기
+font = Consolas
+font_size = 14
+
+# 서버에 알리는 터미널 종류 (기본 xterm, PuTTY와 같음)
+# term = xterm-256color
+
+# 스크롤백 줄 수
+scrollback = 10000
+
+# 색 (#rrggbb)
+foreground = #d4d4d4
+background = #1e1e1e
+cursor = #e8e8e8
+```
+
+값이 잘못되면 창 첫 줄에 어느 줄이 문제인지 표시하고 기본 설정으로 엽니다.
+서버 키 기록(`known_hosts`)도 같은 `%APPDATA%\termhop\` 폴더에 저장됩니다.
 
 ## 아직 없는 것
 
-- 탭, 설정 파일, 저장된 PuTTY 세션(`@이름`), 키 파일 로그인(`-i`)
-- 마우스 보고(전체 화면 프로그램에서 마우스 클릭·휠 전달)
+- 탭, 저장된 PuTTY 세션(`@이름`), 키 파일 로그인(`-i`)
 - PuTTY가 저장해 둔 서버 키 기록 읽기(처음 한 번은 다시 물어봄)
 - 같은 연결 안의 SFTP 패널
 

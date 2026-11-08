@@ -14,6 +14,7 @@ use gpui::{
 };
 use libghostty_vt::fmt::Format;
 use libghostty_vt::key::{self, Key};
+use libghostty_vt::mouse;
 use libghostty_vt::paste;
 use libghostty_vt::render::{CellIterator, CursorVisualStyle, RenderState, RowIterator};
 use libghostty_vt::screen::{CellWide, Screen};
@@ -23,13 +24,10 @@ use libghostty_vt::terminal::{ClipboardMime, Point as GridPoint, PointCoordinate
 use libghostty_vt::Terminal;
 use tokio::sync::{mpsc, oneshot};
 
+use crate::config::Config;
 use crate::ssh::{Cmd, Event, Size};
 
 const PADDING: f32 = 4.0;
-const SCROLLBACK_LINES: usize = 10_000;
-const FOREGROUND: RgbColor = RgbColor { r: 0xd4, g: 0xd4, b: 0xd4 };
-const BACKGROUND: RgbColor = RgbColor { r: 0x1e, g: 0x1e, b: 0x1e };
-const CURSOR: RgbColor = RgbColor { r: 0xe8, g: 0xe8, b: 0xe8 };
 
 enum Mode {
     Session,
@@ -46,6 +44,10 @@ pub struct TermView {
     cells: CellIterator<'static>,
     key_encoder: key::Encoder<'static>,
     key_event: key::Event<'static>,
+    mouse_encoder: mouse::Encoder<'static>,
+    mouse_event: mouse::Event<'static>,
+    /// A button press went to the program, so its release must follow it there.
+    mouse_forwarded: bool,
     // Filled by terminal callbacks during `vt_write`, drained right after.
     replies: Rc<RefCell<Vec<u8>>>,
     clipboard: Rc<RefCell<Option<String>>>,
@@ -54,6 +56,7 @@ pub struct TermView {
     mode: Mode,
     font: Font,
     font_size: Pixels,
+    background: RgbColor,
     size: Option<Size>,
     /// IME composition text, drawn at the cursor until committed.
     preedit: Option<String>,
@@ -78,18 +81,17 @@ impl TermView {
         cx: &mut Context<Self>,
         mut events: mpsc::UnboundedReceiver<Event>,
         cmds: mpsc::UnboundedSender<Cmd>,
-        font_family: String,
-        font_size: f32,
+        config: &Config,
     ) -> Self {
         let replies = Rc::new(RefCell::new(Vec::new()));
         let clipboard = Rc::new(RefCell::new(None));
         let title_changed = Rc::new(Cell::new(false));
 
         let mut term = Terminal::new(80, 24).expect("terminal");
-        term.set_scrollback_max_lines(Some(SCROLLBACK_LINES)).expect("scrollback");
-        term.set_default_fg_color(Some(FOREGROUND))
-            .and_then(|t| t.set_default_bg_color(Some(BACKGROUND)))
-            .and_then(|t| t.set_default_cursor_color(Some(CURSOR)))
+        term.set_scrollback_max_lines(Some(config.scrollback)).expect("scrollback");
+        term.set_default_fg_color(Some(config.foreground))
+            .and_then(|t| t.set_default_bg_color(Some(config.background)))
+            .and_then(|t| t.set_default_cursor_color(Some(config.cursor)))
             .expect("colors");
         term.on_pty_write({
             let replies = replies.clone();
@@ -149,13 +151,17 @@ impl TermView {
             cells: CellIterator::new().expect("cells"),
             key_encoder: key::Encoder::new().expect("key encoder"),
             key_event: key::Event::new().expect("key event"),
+            mouse_encoder: mouse::Encoder::new().expect("mouse encoder"),
+            mouse_event: mouse::Event::new().expect("mouse event"),
+            mouse_forwarded: false,
             replies,
             clipboard,
             title_changed,
             cmds,
             mode: Mode::Session,
-            font: Font { family: font_family.into(), ..gpui::font("") },
-            font_size: px(font_size),
+            font: Font { family: config.font.clone().into(), ..gpui::font("") },
+            font_size: px(config.font_size),
+            background: config.background,
             size: None,
             preedit: None,
             cursor_bounds: None,
@@ -289,34 +295,7 @@ impl TermView {
     /// Keys that don't produce text by themselves (Enter, arrows, Ctrl-C, ...),
     /// encoded the way the running program expects. Plain text goes through the IME.
     fn encode_key(&mut self, ks: &gpui::Keystroke) -> Option<Vec<u8>> {
-        let m = &ks.modifiers;
-        if m.platform {
-            return None;
-        }
-        let (key, unshifted) = match named_key(&ks.key) {
-            Some(k) => (k, '\0'),
-            // Ctrl/Alt chords. On Windows, Ctrl+Alt that produces a character is AltGr:
-            // leave that to the text path.
-            None if (m.control || m.alt) && !is_altgr(ks) && ks.key.chars().count() == 1 => {
-                let c = ks.key.chars().next()?;
-                (char_key(c)?, c)
-            }
-            None => return None,
-        };
-        let mut mods = key::Mods::empty();
-        mods.set(key::Mods::SHIFT, m.shift);
-        mods.set(key::Mods::CTRL, m.control);
-        mods.set(key::Mods::ALT, m.alt);
-        self.key_event
-            .set_action(key::Action::Press)
-            .set_key(key)
-            .set_mods(mods)
-            .set_consumed_mods(key::Mods::empty())
-            .set_unshifted_codepoint(unshifted)
-            .set_utf8(None::<String>);
-        let mut out = Vec::new();
-        self.key_encoder.set_options_from_terminal(&self.term).encode_to_vec(&self.key_event, &mut out).ok()?;
-        (!out.is_empty()).then_some(out)
+        key_bytes(&self.term, &mut self.key_encoder, &mut self.key_event, ks)
     }
 
     fn paste(&mut self, cx: &mut Context<Self>) {
@@ -370,9 +349,37 @@ impl TermView {
         }
     }
 
-    // PuTTY habits: drag selects and copies on release, right click pastes.
+    /// Whether mouse events belong to the program (tmux, vim with mouse on) rather than
+    /// to termhop's own selection. Shift always gives them back to termhop.
+    fn mouse_to_program(&self, modifiers: &gpui::Modifiers) -> bool {
+        matches!(self.mode, Mode::Session) && !modifiers.shift && self.term.is_mouse_tracking().unwrap_or(false)
+    }
+
+    fn send_mouse(
+        &mut self,
+        action: mouse::Action,
+        button: Option<mouse::Button>,
+        position: Point<Pixels>,
+        modifiers: &gpui::Modifiers,
+        any_pressed: bool,
+    ) {
+        let (Some(grid), Some(cell)) = (self.grid, self.grid_point(position)) else { return };
+        self.mouse_event.set_action(action).set_button(button).set_mods(mods_of(modifiers));
+        let out = encode_mouse(&self.term, &mut self.mouse_encoder, &mut self.mouse_event, cell, &grid, any_pressed);
+        if !out.is_empty() {
+            let _ = self.cmds.send(Cmd::Input(out));
+        }
+    }
+
+    // PuTTY habits when the program doesn't take the mouse: drag selects and
+    // copies on release, right click pastes.
     fn mouse_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         window.focus(&self.focus);
+        if self.mouse_to_program(&event.modifiers) {
+            self.send_mouse(mouse::Action::Press, Some(mouse_button(event.button)), event.position, &event.modifiers, true);
+            self.mouse_forwarded = true;
+            return;
+        }
         match event.button {
             MouseButton::Left => {
                 let _ = self.term.set_selection(None);
@@ -385,6 +392,11 @@ impl TermView {
     }
 
     fn mouse_move(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if self.selecting.is_none() && self.mouse_to_program(&event.modifiers) {
+            let button = event.pressed_button.map(mouse_button);
+            self.send_mouse(mouse::Action::Motion, button, event.position, &event.modifiers, button.is_some());
+            return;
+        }
         if self.selecting.is_some() && event.dragging() {
             if let Some(end) = self.grid_point(event.position) {
                 self.select_to(end);
@@ -394,6 +406,10 @@ impl TermView {
     }
 
     fn mouse_up(&mut self, event: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if std::mem::take(&mut self.mouse_forwarded) {
+            self.send_mouse(mouse::Action::Release, Some(mouse_button(event.button)), event.position, &event.modifiers, false);
+            return;
+        }
         if let (Some(start), Some(end)) = (self.selecting.take(), self.grid_point(event.position)) {
             if start != end {
                 self.selecting = Some(start);
@@ -406,19 +422,29 @@ impl TermView {
     }
 
     fn scroll(&mut self, event: &ScrollWheelEvent, _: &mut Window, cx: &mut Context<Self>) {
-        // Full-screen programs (vim, less, screen) own the screen; only the
-        // normal screen has scrollback.
-        if self.term.active_screen().ok() != Some(Screen::Primary) {
-            return;
-        }
         let Some(grid) = self.grid else { return };
         let lines = match event.delta {
-            ScrollDelta::Lines(p) => p.y * 3.0,
+            // Windows already applies the system "lines per notch" setting.
+            ScrollDelta::Lines(p) => p.y * if cfg!(windows) { 1.0 } else { 3.0 },
             ScrollDelta::Pixels(p) => p.y / grid.cell.height,
         } + self.scroll_remainder;
         let whole = lines.trunc();
         self.scroll_remainder = lines - whole;
-        if whole != 0.0 {
+        if whole == 0.0 {
+            return;
+        }
+        if self.mouse_to_program(&event.modifiers) {
+            // Wheel up/down are buttons 4/5 to the program, one press per line.
+            let button = if whole > 0.0 { mouse::Button::Four } else { mouse::Button::Five };
+            for _ in 0..(whole.abs() as usize).min(10) {
+                self.send_mouse(mouse::Action::Press, Some(button), event.position, &event.modifiers, false);
+                self.send_mouse(mouse::Action::Release, Some(button), event.position, &event.modifiers, false);
+            }
+            return;
+        }
+        // Full-screen programs (vim, less, screen) own the screen; only the
+        // normal screen has scrollback.
+        if self.term.active_screen().ok() == Some(Screen::Primary) {
             self.term.scroll_viewport(ScrollViewport::Delta(-(whole as isize)));
             cx.notify();
         }
@@ -438,6 +464,8 @@ impl TermView {
         if self.size != Some(new) {
             let _ = self.term.resize(cols, rows, f32::from(cell.width) as u32, f32::from(cell.height) as u32);
             let _ = self.cmds.send(Cmd::Resize(new));
+            // A program that asked for in-band size reports (mode 2048) gets one now.
+            self.flush_replies();
             self.size = Some(new);
         }
         let grid = Grid { origin, cell, cols, rows };
@@ -595,13 +623,149 @@ struct Frame {
     cursor_cell: Option<CursorCell>,
 }
 
+/// Encode a mouse event at a known cell. The encoder works in whole pixels, which
+/// would drift with a fractional cell width, so it gets a fixed 10x20 grid instead.
+fn encode_mouse(
+    term: &Terminal<'static, 'static>,
+    encoder: &mut mouse::Encoder<'static>,
+    event: &mut mouse::Event<'static>,
+    cell: PointCoordinate,
+    grid: &Grid,
+    any_pressed: bool,
+) -> Vec<u8> {
+    const W: u32 = 10;
+    const H: u32 = 20;
+    event.set_position(mouse::Position { x: (cell.x as u32 * W + W / 2) as f32, y: (cell.y * H + H / 2) as f32 });
+    encoder
+        .set_options_from_terminal(term)
+        .set_size(mouse::EncoderSize {
+            screen_width: grid.cols as u32 * W,
+            screen_height: grid.rows as u32 * H,
+            cell_width: W,
+            cell_height: H,
+            padding_top: 0,
+            padding_bottom: 0,
+            padding_right: 0,
+            padding_left: 0,
+        })
+        .set_any_button_pressed(any_pressed)
+        .set_track_last_cell(true);
+    let mut out = Vec::new();
+    let _ = encoder.encode_to_vec(event, &mut out);
+    out
+}
+
+fn mods_of(m: &gpui::Modifiers) -> key::Mods {
+    let mut mods = key::Mods::empty();
+    mods.set(key::Mods::SHIFT, m.shift);
+    mods.set(key::Mods::CTRL, m.control);
+    mods.set(key::Mods::ALT, m.alt);
+    mods
+}
+
+fn mouse_button(b: MouseButton) -> mouse::Button {
+    match b {
+        MouseButton::Left => mouse::Button::Left,
+        MouseButton::Right => mouse::Button::Right,
+        MouseButton::Middle => mouse::Button::Middle,
+        _ => mouse::Button::Unknown,
+    }
+}
+
 fn hsla(c: RgbColor) -> Hsla {
     gpui::rgb(((c.r as u32) << 16) | ((c.g as u32) << 8) | c.b as u32).into()
+}
+
+fn key_bytes(
+    term: &Terminal<'static, 'static>,
+    encoder: &mut key::Encoder<'static>,
+    event: &mut key::Event<'static>,
+    ks: &gpui::Keystroke,
+) -> Option<Vec<u8>> {
+    let m = &ks.modifiers;
+    if m.platform {
+        return None;
+    }
+    // Alt+F4 closes the window, as in PuTTY.
+    if cfg!(windows) && m.alt && !m.control && ks.key == "f4" {
+        return None;
+    }
+    let mut encode = |key: Key, unshifted: char, text: Option<String>| {
+        event
+            .set_action(key::Action::Press)
+            .set_key(key)
+            .set_mods(mods_of(m))
+            .set_consumed_mods(key::Mods::empty())
+            .set_unshifted_codepoint(unshifted)
+            .set_utf8(text);
+        let mut out = Vec::new();
+        encoder
+            .set_options_from_terminal(term)
+            // Alt is Meta (ESC prefix), as in PuTTY, on macOS too.
+            .set_macos_option_as_alt(key::OptionAsAlt::True)
+            .encode_to_vec(event, &mut out)
+            .ok()?;
+        (!out.is_empty()).then_some(out)
+    };
+    if let Some(key) = named_key(&ks.key) {
+        return encode(key, '\0', None);
+    }
+    // Ctrl/Alt chords. On Windows, Ctrl+Alt that produces a character is AltGr:
+    // leave that to the text path.
+    if !(m.control || m.alt) || is_altgr(ks) {
+        return None;
+    }
+    // The character the chord was typed on, with Shift applied ("A", "_", ">").
+    let typed = match ks.key.as_str() {
+        "space" => ' ',
+        k if k.chars().count() == 1 => {
+            let c = k.chars().next()?;
+            if m.shift { c.to_ascii_uppercase() } else { c }
+        }
+        _ => return None,
+    };
+    let unshifted = typed.to_ascii_lowercase();
+    // Ctrl+Shift+letter: the encoder answers with a CSI u sequence that shells on
+    // older servers don't know. xterm sends the plain control byte; do the same
+    // unless the program turned on the kitty keyboard protocol.
+    let kitty = term.kitty_keyboard_flags().is_ok_and(|f| !f.is_empty());
+    if m.control && m.shift && typed.is_ascii_alphabetic() && !kitty {
+        return legacy_chord(typed, true, m.alt);
+    }
+    char_key(unshifted)
+        .and_then(|key| encode(key, unshifted, Some(typed.to_string())))
+        .or_else(|| legacy_chord(typed, m.control, m.alt))
+}
+
+/// What xterm sends for chords the encoder leaves empty (Ctrl+_, Ctrl+Shift+letter, Alt+>).
+fn legacy_chord(c: char, ctrl: bool, alt: bool) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    if alt {
+        out.push(0x1b);
+    }
+    if ctrl {
+        out.push(match c {
+            '@' | ' ' | '2' => 0,
+            'a'..='z' => c as u8 - b'a' + 1,
+            'A'..='Z' => c as u8 - b'A' + 1,
+            '[' | '3' => 0x1b,
+            '\\' | '4' => 0x1c,
+            ']' | '5' => 0x1d,
+            '^' | '6' => 0x1e,
+            '_' | '/' | '7' => 0x1f,
+            '?' | '8' => 0x7f,
+            _ => return None,
+        });
+    } else {
+        out.extend_from_slice(c.encode_utf8(&mut [0; 4]).as_bytes());
+    }
+    Some(out)
 }
 
 fn named_key(name: &str) -> Option<Key> {
     Some(match name {
         "enter" => Key::Enter,
+        "space" => return None, // a chord with Space is handled with the other characters
         "tab" => Key::Tab,
         "backspace" => Key::Backspace,
         "escape" => Key::Escape,
@@ -691,13 +855,20 @@ impl Render for TermView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .size_full()
-            .bg(hsla(BACKGROUND))
+            .bg(hsla(self.background))
             .track_focus(&self.focus)
             .on_key_down(cx.listener(Self::key_down))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::mouse_down))
             .on_mouse_down(MouseButton::Right, cx.listener(Self::mouse_down))
+            .on_mouse_down(MouseButton::Middle, cx.listener(Self::mouse_down))
             .on_mouse_move(cx.listener(Self::mouse_move))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::mouse_up))
+            .on_mouse_up(MouseButton::Right, cx.listener(Self::mouse_up))
+            .on_mouse_up(MouseButton::Middle, cx.listener(Self::mouse_up))
+            // A drag released outside the window still ends the selection.
+            .on_mouse_up_out(MouseButton::Left, cx.listener(Self::mouse_up))
+            .on_mouse_up_out(MouseButton::Right, cx.listener(Self::mouse_up))
+            .on_mouse_up_out(MouseButton::Middle, cx.listener(Self::mouse_up))
             .on_scroll_wheel(cx.listener(Self::scroll))
             .child(TermElement { view: cx.entity() })
     }
@@ -946,3 +1117,62 @@ impl Element for TermElement {
     }
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn grid(cols: u16, rows: u16) -> Grid {
+        Grid { origin: point(px(0.0), px(0.0)), cell: size(px(8.4), px(18.0)), cols, rows }
+    }
+
+    fn keystroke(key: &str, ctrl: bool, alt: bool, shift: bool) -> gpui::Keystroke {
+        gpui::Keystroke {
+            modifiers: gpui::Modifiers { control: ctrl, alt, shift, ..Default::default() },
+            key: key.into(),
+            key_char: None,
+        }
+    }
+
+    #[test]
+    fn chords_send_what_xterm_sends() {
+        let term = Terminal::new(80, 24).unwrap();
+        let mut encoder = key::Encoder::new().unwrap();
+        let mut event = key::Event::new().unwrap();
+        let mut k = |key: &str, ctrl, alt, shift| key_bytes(&term, &mut encoder, &mut event, &keystroke(key, ctrl, alt, shift));
+        assert_eq!(k("a", true, false, false), Some(vec![1]));
+        assert_eq!(k("space", true, false, false), Some(vec![0]));
+        assert_eq!(k("_", true, false, false), Some(vec![0x1f]));
+        assert_eq!(k("a", true, false, true), Some(vec![1]));
+        assert_eq!(k("a", false, true, false), Some(b"\x1ba".to_vec()));
+        assert_eq!(k("a", false, true, true), Some(b"\x1bA".to_vec()));
+        assert_eq!(k(">", false, true, false), Some(b"\x1b>".to_vec()));
+        assert_eq!(k("enter", false, false, false), Some(b"\r".to_vec()));
+        assert_eq!(k("up", false, false, false), Some(b"\x1b[A".to_vec()));
+        // Plain text is left to the IME path.
+        assert_eq!(k("a", false, false, false), None);
+        assert_eq!(k("space", false, false, false), None);
+    }
+
+    #[test]
+    fn mouse_reports_follow_the_program_mode() {
+        let mut term = Terminal::new(120, 40).unwrap();
+        let mut encoder = mouse::Encoder::new().unwrap();
+        let mut event = mouse::Event::new().unwrap();
+        let g = grid(120, 40);
+        let far = PointCoordinate { x: 99, y: 29 };
+
+        event.set_action(mouse::Action::Press).set_button(Some(mouse::Button::Left)).set_mods(key::Mods::empty());
+        // Nothing until the program asks for the mouse.
+        assert!(encode_mouse(&term, &mut encoder, &mut event, far, &g, true).is_empty());
+
+        term.vt_write(b"\x1b[?1000h\x1b[?1006h");
+        assert_eq!(encode_mouse(&term, &mut encoder, &mut event, far, &g, true), b"\x1b[<0;100;30M");
+
+        event.set_action(mouse::Action::Release);
+        assert_eq!(encode_mouse(&term, &mut encoder, &mut event, far, &g, false), b"\x1b[<0;100;30m");
+
+        event.set_action(mouse::Action::Press).set_button(Some(mouse::Button::Four));
+        assert_eq!(encode_mouse(&term, &mut encoder, &mut event, PointCoordinate { x: 0, y: 0 }, &g, false), b"\x1b[<64;1;1M");
+    }
+}
