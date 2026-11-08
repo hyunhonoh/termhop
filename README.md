@@ -1,94 +1,99 @@
-# termhop
+# termhop — next 브랜치 (2단계 시험판)
 
-PuTTY를 실행하도록 되어 있는 런처(웹 접속 버튼, 접속 관리 도구 등)에서 넘어오는 인자를 그대로 받아,
-**WezTerm** 또는 **Windows Terminal**의 새 탭에서 세션을 엽니다. 실제 접속은 PuTTY의 명령줄 버전인
-**plink**가 하므로, PuTTY로 되던 접속은 그대로 됩니다.
+> 이 브랜치는 개발 중인 **termhop-next** 시험판입니다.
+> 지금 쓸 수 있는 1단계(PuTTY 인자를 받아 WezTerm/Windows Terminal에서 plink로 여는 런처)의 설명은
+> [main 브랜치 README](https://github.com/hyunhonoh/termhop/tree/main#readme)를 보세요. 1단계 코드는 이 브랜치에도 그대로 있습니다(`src/`).
 
-```
-런처 ──(-l user -P 22 -pw ... host)──▶ termhop ──▶ WezTerm 새 탭 ─▶ plink -ssh -l user -P 22 ... host
-```
+## 왜 만드나
 
-- 이미 열린 WezTerm 창이 있으면 탭으로 추가하고, 없으면 새 창을 엽니다.
-- 인자는 손대지 않고 plink에 넘깁니다(`-l`, `-P`, `-pw`, `-i`, `-load`, `-L` 등). 프로토콜 옵션이 없으면 `-ssh`만 붙이고,
-  PuTTY의 `@세션이름` 표기는 `-load 세션이름`으로 바꿉니다.
-- 의존성 없는 작은 실행 파일 하나입니다.
+1단계는 접속을 plink에 맡기고, 그 plink를 Windows 콘솔(ConPTY) 안에서 실행해 터미널 탭에 띄웁니다.
+이 경로에서는 서버가 보낸 화면이 콘솔 변환층을 한 번 거칩니다. 그래서 `screen`처럼 화면 전체를 그리는 프로그램은
+줄이 어긋날 수 있고, 문자셋(CP949)이나 창 크기 전달도 중간에서 틀어질 수 있습니다.
 
-## 설치
-
-1. [Releases](https://github.com/hyunhonoh/termhop/releases)에서 `termhop-v<버전>-windows-x64.exe`를 받아
-   원하는 폴더에 두고 `termhop.exe`로 이름을 바꿉니다.
-   - 처음 실행할 때 "Windows의 PC 보호" 창이 뜨면 **추가 정보 → 실행**을 누르거나, 파일 속성에서 **차단 해제**를 체크합니다.
-2. plink와 터미널을 설치합니다.
-   ```
-   winget install PuTTY.PuTTY
-   winget install wez.wezterm
-   ```
-   Windows Terminal은 Windows 11에 기본으로 들어 있습니다.
-
-## 연결하기
-
-런처가 PuTTY를 부르는 방식에 맞춰 termhop을 대신 부르게 하면 됩니다.
-
-- **런처 설정에 실행 파일 경로 항목이 있으면**: `termhop.exe` 경로로 바꿉니다.
-- **런처가 정해진 경로의 실행 파일을 부르면**: 그 파일을 다른 이름으로 바꿔 두고(예: `putty.exe` → `putty-original.exe`),
-  `termhop.exe`를 그 자리에 원래 이름으로 복사합니다.
-  이 경우 설정 파일은 `%APPDATA%\termhop\termhop.conf`에 두는 것을 권장합니다(Program Files는 쓰기 권한이 필요).
-- **URL 프로토콜로 실행되면**: 해당 레지스트리 명령의 실행 파일을 `termhop.exe`로 바꿉니다.
-
-**되돌리기**: 위에서 바꾼 경로, 파일 이름, 레지스트리 값을 원래대로 돌려놓으면 PuTTY로 돌아갑니다.
-
-## 처음 접속할 때
-
-- 처음 접속하는 서버는 탭 안에서 plink가 `Store key in cache? (y/n, ...)`를 묻습니다. `y`를 누르면 됩니다.
-  PuTTY로 이미 접속했던 서버는 같은 기록을 쓰므로 묻지 않습니다.
-- **WezTerm은 기본 설정에서 접속이 끝나면 탭을 바로 닫습니다.** 접속에 실패했을 때 메시지를 보려면
-  `wezterm.lua`에 다음 줄을 추가하세요.
-  ```lua
-  config.exit_behavior = "CloseOnCleanExit"
-  ```
-- **탭이 열렸다가 바로 닫히면**: 위 설정을 넣고 다시 접속해 메시지를 확인하세요.
-  `unknown option "-no-antispoof"`가 보이면 plink가 0.71보다 오래된 것입니다.
-  `winget upgrade PuTTY.PuTTY`로 업데이트하거나, 설정에 `access_prompt = on`을 적으세요.
-
-## 설정 (선택)
-
-`termhop.exe`와 같은 폴더, 또는 `%APPDATA%\termhop\`에 `termhop.conf`를 **UTF-8**로 저장합니다.
-설정 파일이 없으면 PATH와 기본 설치 경로에서 프로그램을 찾고 WezTerm을 씁니다.
-
-```ini
-# wezterm(기본) 또는 wt
-terminal = wezterm
-
-# 로그인 뒤 "Press Return to begin session"에서 Enter를 눌러야 세션이 시작되게 하려면 on
-# (기본 off: PuTTY처럼 바로 들어갑니다)
-# access_prompt = on
-
-# 자동으로 못 찾을 때만 경로를 적습니다
-# plink = C:\Program Files\PuTTY\plink.exe
-# wezterm = C:\Program Files\WezTerm\wezterm.exe
-# wt = C:\Users\me\AppData\Local\Microsoft\WindowsApps\wt.exe
-```
-
-## 확인
-
-`termhop.exe`를 인자 없이 실행하면 사용법과 설정 파일 위치가 나옵니다.
-
-`--termhop-dry-run`을 붙이면 실행하지 않고 실행할 명령만 보여 줍니다(`-pw` 값은 `****`로 표시).
+termhop-next는 이 중간 단계를 없앤 **창 하나짜리 SSH 터미널**입니다. 명령줄은 PuTTY와 같은 형태로 받습니다.
 
 ```
-termhop --termhop-dry-run -l user -P 22 example.com
+런처 ──(-l user -P 22 -pw ... host)──▶ termhop-next ─┬─ russh ────────── SSH 연결
+                                                      ├─ libghostty-vt ── 터미널 화면 상태
+                                                      └─ GPUI ─────────── 창·글꼴·입력(IME)
 ```
 
-그다음 `Win+R`에서 `termhop.exe -l 사용자 서버주소`를 실행해 탭이 열리는지 보고, 런처에 연결합니다.
+서버가 보낸 바이트는 변환 없이 그대로 libghostty-vt에 들어가고, 창 크기가 바뀌면 그때마다 서버에 직접 알립니다.
+
+## 설계
+
+| 역할 | 선택 | 이유 |
+|---|---|---|
+| SSH | [russh](https://github.com/warp-tech/russh) | 순수 Rust. 최신 알고리즘을 먼저 쓰고, 오래된 서버용 알고리즘(DH group1/14/GEX-SHA1, CBC, HMAC-SHA1)을 가장 낮은 우선순위로 붙임 |
+| 터미널 상태 | [libghostty-vt](https://github.com/ghostty-org/ghostty) ([Rust 바인딩](https://github.com/uzaaft/libghostty-rs)) | Ghostty의 터미널 엔진. 제어 코드 해석, 스크롤백, 키 인코딩, 선택, OSC 52까지 처리 |
+| 화면 | [GPUI](https://www.gpui.rs/) (Zed) | GPU로 그리는 Rust UI. 한글 등 IME 조합 입력 지원 |
+
+코드 구성(`next/src/`):
+
+- `args.rs` — PuTTY식 명령줄 해석. `-l`, `-pw`, `-P`, `[user@]host`. plink용 조정 옵션(`-ssh`, `-no-antispoof`, `-batch` 등)은 무시하고, 그 밖의 옵션은 오류로 알림
+- `ssh.rs` — 접속·인증·셸. UI와는 채널 두 개(입력/크기 변경 ↔ 출력/알림/질문)로만 주고받음
+  - 인증 순서: 비밀번호(`-pw`) → keyboard-interactive → 터미널에서 직접 입력(최대 3회)
+  - 서버 키: `%APPDATA%\termhop\known_hosts`에 저장. 처음 보는 서버는 지문을 보여 주고 `y`를 받아야 접속
+  - 서버에 알리는 터미널 종류: `xterm` (PuTTY와 같음)
+- `term.rs` — libghostty-vt 화면을 GPUI로 그리기, 키보드·마우스·IME 처리
+  - 같은 모양의 ASCII는 한 줄로 묶어 그리고, 한글·기호는 칸마다 따로 그려 대체 글꼴의 폭 차이 때문에 뒤 글자가 밀리지 않게 함
+  - Enter·방향키·Ctrl 조합은 libghostty의 키 인코더로 보내고, 글자 입력은 IME를 거쳐 보냄
+
+## 시험판 받기
+
+[Releases의 next-alpha](https://github.com/hyunhonoh/termhop/releases/tag/next-alpha)에서 `termhop-next.exe`를 받습니다.
+next 브랜치에 푸시될 때마다 새로 만들어집니다.
+처음 실행할 때 "Windows의 PC 보호" 창이 뜨면 **추가 정보 → 실행**을 누르세요.
+
+## 테스트 방법
+
+1단계 런처를 그대로 둔 채, 같은 인자로 따로 실행해 볼 수 있습니다.
+
+```
+termhop-next.exe -l 사용자 -P 22 서버주소
+termhop-next.exe -l 사용자 -pw 비밀번호 -P 22 서버주소
+```
+
+런처에서 바로 띄우려면 1단계 README의 "연결하기"처럼 PuTTY 대신 `termhop-next.exe`를 부르게 하면 됩니다.
+
+### 확인할 것
+
+- [ ] 접속과 로그인이 되는지(`-pw`를 줬을 때, 안 줬을 때)
+- [ ] 처음 접속할 때 서버 키 질문이 나오고, `y` 후 다음 접속부터는 묻지 않는지
+- [ ] `screen`에서 줄이 어긋나지 않는지(`Ctrl+A S` 분할, `Ctrl+A Tab`, 창 크기 바꾸기)
+- [ ] 한글 입력: 조합 중인 글자가 커서 자리에 보이는지, 입력 후보 창이 커서 근처에 뜨는지
+- [ ] 한글 출력: `ls`, `cat`으로 한글 파일 이름·내용이 칸에 맞게 보이는지
+- [ ] `vi`/`top` 같은 전체 화면 프로그램, 색상
+- [ ] 드래그로 선택하면 복사, 오른쪽 클릭으로 붙여넣기
+- [ ] 서버에서 OSC 52로 보낸 텍스트가 PC 클립보드에 들어오는지
+  (`printf "\033]52;c;$(printf hello | base64)\a"` 실행 후 메모장에 붙여넣기)
+
+### 조작
+
+| 동작 | 키 |
+|---|---|
+| 복사 | 드래그(놓으면 복사), `Ctrl+Shift+C` |
+| 붙여넣기 | 오른쪽 클릭, `Ctrl+Shift+V`, `Shift+Insert` |
+| 스크롤백 | 마우스 휠(전체 화면 프로그램 밖에서) |
+| 글꼴 바꾸기 | 환경 변수 `TERMHOP_FONT`(기본 Consolas), `TERMHOP_FONT_SIZE`(기본 14) |
+
+## 아직 없는 것
+
+- 탭, 설정 파일, 저장된 PuTTY 세션(`@이름`), 키 파일 로그인(`-i`)
+- 마우스 보고(전체 화면 프로그램에서 마우스 클릭·휠 전달)
+- PuTTY가 저장해 둔 서버 키 기록 읽기(처음 한 번은 다시 물어봄)
+- 같은 연결 안의 SFTP 패널
 
 ## 빌드
 
+[Zig](https://ziglang.org/) 0.17이 필요합니다(libghostty-vt를 소스에서 빌드).
+
 ```
+cd next
 cargo build --release
 ```
 
-Windows 실행 파일은 GitHub Actions(`.github/workflows/build.yml`)에서도 만들어집니다.
-`v*` 태그를 푸시하면 Releases에 `termhop-v<버전>-windows-x64.exe`가 첨부됩니다.
+Windows 실행 파일은 GitHub Actions(`.github/workflows/build.yml`의 `next` 작업)에서도 만들어집니다.
 
 ## 라이선스
 

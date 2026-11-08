@@ -23,6 +23,49 @@ jobs:
           name: termhop-windows-x64
           path: target/release/termhop.exe
 
+  # termhop-next (next/): russh + libghostty-vt + GPUI. Alpha.
+  next:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: next
+    steps:
+      - uses: actions/checkout@v7
+      # libghostty-vt is built from source with Zig.
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.17.1
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: next
+      - run: cargo test --locked
+      - run: cargo build --release --locked
+      - uses: actions/upload-artifact@v7
+        with:
+          name: termhop-next-windows-x64
+          path: next/target/release/termhop-next.exe
+
+  # Push to the next branch: replace the "next-alpha" prerelease with this build.
+  next-release:
+    needs: next
+    if: github.event_name == 'push' && github.ref == 'refs/heads/next'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: termhop-next-windows-x64
+      - name: Publish prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release delete next-alpha --cleanup-tag --yes || true
+          gh release create next-alpha termhop-next.exe --prerelease --target "$GITHUB_SHA" \
+            --title "termhop-next alpha (${GITHUB_SHA::7})" \
+            --notes "next 브랜치 시험판입니다. 사용법과 확인할 것은 next 브랜치 README를 보세요."
+
   # Tag push (v*): publish a GitHub Release with the exe attached.
   release:
     needs: windows

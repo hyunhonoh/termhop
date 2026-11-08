@@ -1,0 +1,17 @@
+[package]
+name = "termhop-next"
+version = "0.2.0-alpha.1"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[dependencies]
+libghostty-vt = { git = "https://github.com/uzaaft/libghostty-rs", rev = "84373f8d48b8f0b794e259f74a71a52686616f5d" }
+gpui = { version = "=0.2.2", features = ["runtime_shaders"] }
+russh = { version = "=0.65.1", default-features = false, features = ["ring", "rsa", "flate2", "des"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "net", "time"] }
+
+[profile.release]
+lto = "thin"
+strip = true
+codegen-units = 1
