@@ -6,7 +6,7 @@ use std::rc::Rc;
 
 use gpui::{
     fill, outline, point, px, relative, size, App, Bounds, BorderStyle, ClipboardItem, Context,
-    ElementId, ElementInputHandler, Entity, EntityInputHandler, FocusHandle, Focusable, Font,
+    ElementId, ElementInputHandler, Entity, EntityInputHandler, EventEmitter, FocusHandle, Focusable, Font,
     FontStyle, FontWeight, GlobalElementId, Hsla, InspectorElementId, IntoElement, KeyDownEvent,
     LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Render,
     ScrollDelta, ScrollWheelEvent, ShapedLine, Style, TextRun, UTF16Selection, UnderlineStyle,
@@ -36,8 +36,17 @@ enum Mode {
     Closed,
 }
 
+/// What a pane tells the workspace around it.
+pub enum PaneEvent {
+    TitleChanged,
+    /// The session is over and the user pressed a key: remove this pane.
+    Close,
+}
+
 pub struct TermView {
     focus: FocusHandle,
+    /// Set by the program with OSC 0/2; shown on the tab and the window.
+    title: Option<String>,
     term: Terminal<'static, 'static>,
     render_state: RenderState<'static>,
     rows: RowIterator<'static>,
@@ -141,9 +150,9 @@ impl TermView {
                         Err(_) => break,
                     }
                 }
-                let alive = this.update_in(cx, |view, window, cx| {
+                let alive = this.update(cx, |view, cx| {
                     for event in batch {
-                        view.handle_event(event, window, cx);
+                        view.handle_event(event, cx);
                     }
                     cx.notify();
                 });
@@ -156,6 +165,7 @@ impl TermView {
 
         TermView {
             focus: cx.focus_handle(),
+            title: None,
             term,
             render_state: RenderState::new().expect("render state"),
             rows: RowIterator::new().expect("rows"),
@@ -184,9 +194,19 @@ impl TermView {
         }
     }
 
-    fn handle_event(&mut self, event: Event, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn title(&self) -> Option<&str> {
+        self.title.as_deref().filter(|t| !t.is_empty())
+    }
+
+    /// The area the terminal grid was last laid out in, for moving between panes.
+    pub fn grid_bounds(&self) -> Option<Bounds<Pixels>> {
+        let g = self.grid?;
+        Some(Bounds::new(g.origin, size(g.cell.width * g.cols as f32, g.cell.height * g.rows as f32)))
+    }
+
+    fn handle_event(&mut self, event: Event, cx: &mut Context<Self>) {
         match event {
-            Event::Output(bytes) => self.feed(&bytes, window, cx),
+            Event::Output(bytes) => self.feed(&bytes, cx),
             Event::Notice(text) => self.notice(&text),
             Event::Prompt { text, echo, reply } => {
                 self.show(&text);
@@ -194,7 +214,7 @@ impl TermView {
             }
             Event::Closed(reason) => {
                 if !reason.is_empty() {
-                    self.notice(&format!("{reason} 아무 키나 누르면 창을 닫습니다."));
+                    self.notice(&format!("{reason} 아무 키나 누르면 닫습니다."));
                 }
                 self.mode = Mode::Closed;
             }
@@ -202,7 +222,7 @@ impl TermView {
     }
 
     /// Server output into the terminal, then whatever the terminal wants sent back.
-    fn feed(&mut self, bytes: &[u8], window: &mut Window, cx: &mut Context<Self>) {
+    fn feed(&mut self, bytes: &[u8], cx: &mut Context<Self>) {
         self.term.vt_write(bytes);
         self.flush_replies();
         if let Some(text) = self.clipboard.borrow_mut().take() {
@@ -210,7 +230,8 @@ impl TermView {
         }
         if self.title_changed.replace(false) {
             if let Ok(title) = self.term.title() {
-                window.set_window_title(&String::from_utf8_lossy(title));
+                self.title = Some(String::from_utf8_lossy(title).into_owned());
+                cx.emit(PaneEvent::TitleChanged);
             }
         }
     }
@@ -241,7 +262,7 @@ impl TermView {
     }
 
     /// Committed text from the keyboard or IME.
-    fn type_text(&mut self, text: &str, window: &mut Window) {
+    fn type_text(&mut self, text: &str, cx: &mut Context<Self>) {
         match &mut self.mode {
             Mode::Session => self.send(text.as_bytes().to_vec()),
             Mode::Prompt { echo, line, .. } => {
@@ -251,11 +272,11 @@ impl TermView {
                     self.show(&text);
                 }
             }
-            Mode::Closed => window.remove_window(),
+            Mode::Closed => cx.emit(PaneEvent::Close),
         }
     }
 
-    fn key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+    fn key_down(&mut self, event: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
         let ks = &event.keystroke;
         if is_paste(ks) {
             self.paste(cx);
@@ -269,7 +290,7 @@ impl TermView {
         }
         match &mut self.mode {
             Mode::Closed => {
-                window.remove_window();
+                cx.emit(PaneEvent::Close);
                 cx.stop_propagation();
             }
             Mode::Prompt { echo, line, .. } => {
@@ -706,7 +727,7 @@ fn mouse_button(b: MouseButton) -> mouse::Button {
     }
 }
 
-fn hsla(c: RgbColor) -> Hsla {
+pub fn hsla(c: RgbColor) -> Hsla {
     gpui::rgb(((c.r as u32) << 16) | ((c.g as u32) << 8) | c.b as u32).into()
 }
 
@@ -879,6 +900,8 @@ fn is_copy(ks: &gpui::Keystroke) -> bool {
     }
 }
 
+impl EventEmitter<PaneEvent> for TermView {}
+
 impl Focusable for TermView {
     fn focus_handle(&self, _: &App) -> FocusHandle {
         self.focus.clone()
@@ -935,10 +958,10 @@ impl EntityInputHandler for TermView {
         cx.notify();
     }
 
-    fn replace_text_in_range(&mut self, _: Option<Range<usize>>, text: &str, window: &mut Window, cx: &mut Context<Self>) {
+    fn replace_text_in_range(&mut self, _: Option<Range<usize>>, text: &str, _: &mut Window, cx: &mut Context<Self>) {
         self.preedit = None;
         if !text.is_empty() {
-            self.type_text(text, window);
+            self.type_text(text, cx);
         }
         cx.notify();
     }

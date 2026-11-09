@@ -36,26 +36,49 @@ pub enum Event {
 
 type Events = mpsc::UnboundedSender<Event>;
 
-/// `term` is the terminal type announced to the server (`xterm` by default, as PuTTY does).
-pub fn spawn(
-    rt: &tokio::runtime::Handle,
-    target: Target,
-    term: String,
-    events: Events,
-    cmds: mpsc::UnboundedReceiver<Cmd>,
-) {
-    rt.spawn(async move {
-        let reason = session(target, &term, &events, cmds).await.unwrap_or_else(|e| e);
-        let _ = events.send(Event::Closed(reason));
-    });
+/// One terminal pane's ends of the channels: what the shell sends it, what it sends the shell.
+pub struct Pane {
+    pub events: Events,
+    pub cmds: mpsc::UnboundedReceiver<Cmd>,
 }
 
-async fn session(
-    target: Target,
-    term: &str,
-    events: &Events,
-    mut cmds: mpsc::UnboundedReceiver<Cmd>,
-) -> Result<String, String> {
+/// Opens more shells on the connection that is already logged in, one per pane.
+/// The connection ends when every copy of this is dropped (the window closed).
+#[derive(Clone)]
+pub struct Connection(mpsc::UnboundedSender<Pane>);
+
+impl Connection {
+    pub fn open(&self, pane: Pane) {
+        if let Err(mpsc::error::SendError(pane)) = self.0.send(pane) {
+            let _ = pane.events.send(Event::Closed("연결이 끊겨 새 셸을 열 수 없습니다.".into()));
+        }
+    }
+}
+
+/// Connect and log in, talking to the user through `first`, then open a shell there.
+/// `term` is the terminal type announced to the server (`xterm` by default, as PuTTY does).
+pub fn spawn(rt: &tokio::runtime::Handle, target: Target, term: String, first: Pane) -> Connection {
+    let (tx, mut more) = mpsc::unbounded_channel::<Pane>();
+    rt.spawn(async move {
+        let handle = match connect(target, &first.events).await {
+            Ok(handle) => Arc::new(handle),
+            Err(reason) => {
+                let _ = first.events.send(Event::Closed(reason));
+                return;
+            }
+        };
+        let term: Arc<str> = term.into();
+        tokio::spawn(shell(handle.clone(), term.clone(), first, false));
+        // Panes asked for while logging in waited in the channel; they open now.
+        while let Some(pane) = more.recv().await {
+            tokio::spawn(shell(handle.clone(), term.clone(), pane, true));
+        }
+        let _ = handle.disconnect(Disconnect::ByApplication, "", "").await;
+    });
+    Connection(tx)
+}
+
+async fn connect(target: Target, events: &Events) -> Result<client::Handle<Client>, String> {
     let Target { host, port, user, password } = target;
     notice(events, format!("{host}:{port} 에 연결하는 중..."));
 
@@ -76,8 +99,25 @@ async fn session(
         None => ask(events, "login as: ", true).await.filter(|u| !u.is_empty()).ok_or("로그인을 취소했습니다.")?,
     };
     authenticate(&mut handle, &user, &host, password, events).await?;
+    Ok(handle)
+}
 
-    // The pty is sized from the window, so wait for the first layout.
+/// One shell in its own session channel, until it exits or its pane closes.
+/// `extra` is any shell after the first, which some servers refuse.
+async fn shell(handle: Arc<client::Handle<Client>>, term: Arc<str>, pane: Pane, extra: bool) {
+    let Pane { events, cmds } = pane;
+    let reason = run_shell(&handle, &term, &events, cmds, extra).await.unwrap_or_else(|e| e);
+    let _ = events.send(Event::Closed(reason));
+}
+
+async fn run_shell(
+    handle: &client::Handle<Client>,
+    term: &str,
+    events: &Events,
+    mut cmds: mpsc::UnboundedReceiver<Cmd>,
+    extra: bool,
+) -> Result<String, String> {
+    // The pty is sized from the pane, so wait for its first layout.
     // Keystrokes typed in the meantime are replayed once the shell is up.
     let mut early_input = Vec::new();
     let size = loop {
@@ -88,7 +128,14 @@ async fn session(
         }
     };
 
-    let channel = handle.channel_open_session().await.map_err(|e| format!("세션을 열지 못했습니다: {e}"))?;
+    let channel = handle.channel_open_session().await.map_err(|e| {
+        if extra {
+            // sshd with MaxSessions 1, or a gateway that passes one session through.
+            format!("이 연결에서 셸을 하나 더 열지 못했습니다. 서버가 연결 하나에 셸 하나만 허용하는 것 같습니다 ({e}).")
+        } else {
+            format!("셸 채널을 열지 못했습니다: {e}")
+        }
+    })?;
     channel
         .request_pty(false, term, size.cols.into(), size.rows.into(), size.width_px, size.height_px, &[])
         .await
@@ -112,37 +159,46 @@ async fn session(
                 }
             }
         }
+        // The pane was closed: end this shell, leave the connection to the others.
+        let _ = writer.close().await;
     });
     if !early_input.is_empty() {
         let _ = to_writer.send(Cmd::Input(early_input));
     }
 
     let mut exit_status = None;
+    let mut to_writer = Some(to_writer);
+    // Some servers (paramiko-based gateways among them) say yes to a second shell
+    // but only ever serve the first. Say so instead of leaving an empty pane.
+    let silence = tokio::time::sleep(std::time::Duration::from_secs(5));
+    tokio::pin!(silence);
+    let mut heard = !extra;
     loop {
         tokio::select! {
+            () = &mut silence, if !heard => {
+                heard = true;
+                notice(events, "5초 동안 서버에서 아무 출력이 없습니다. 서버가 연결 하나에 셸 하나만 처리하는 것 같습니다. 이 칸은 닫아도 됩니다.");
+            }
             msg = reader.wait() => match msg {
                 Some(ChannelMsg::Data { data }) | Some(ChannelMsg::ExtendedData { data, .. }) => {
-                    if events.send(Event::Output(data.to_vec())).is_err() {
-                        break;
-                    }
+                    heard = true;
+                    let _ = events.send(Event::Output(data.to_vec()));
                 }
                 Some(ChannelMsg::ExitStatus { exit_status: code }) => exit_status = Some(code),
                 Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) | None => break,
                 _ => {}
             },
-            cmd = cmds.recv() => match cmd {
+            cmd = cmds.recv(), if to_writer.is_some() => match cmd {
                 Some(cmd) => {
-                    let _ = to_writer.send(cmd);
+                    if let Some(w) = &to_writer {
+                        let _ = w.send(cmd);
+                    }
                 }
-                // The window was closed.
-                None => {
-                    let _ = handle.disconnect(Disconnect::ByApplication, "", "").await;
-                    return Ok(String::new());
-                }
+                // The pane was closed; the writer task closes the channel.
+                None => to_writer = None,
             },
         }
     }
-    let _ = handle.disconnect(Disconnect::ByApplication, "", "").await;
     Ok(match exit_status {
         Some(code) => format!("세션이 끝났습니다 (종료 코드 {code})."),
         None => "세션이 끝났습니다.".into(),

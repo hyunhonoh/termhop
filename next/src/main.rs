@@ -7,8 +7,9 @@ mod args;
 mod config;
 mod ssh;
 mod term;
+mod workspace;
 
-use gpui::{px, size, App, AppContext, Application, Bounds, Focusable, TitlebarOptions, WindowBounds, WindowOptions};
+use gpui::{px, size, App, AppContext, Application, Bounds, TitlebarOptions, WindowBounds, WindowOptions};
 use tokio::sync::mpsc;
 
 fn main() {
@@ -34,17 +35,17 @@ fn main() {
     for problem in config_problems {
         let _ = event_tx.send(ssh::Event::Notice(problem));
     }
-    let title = match &target {
+    let (title, conn) = match &target {
         Ok(t) => {
             let title = format!("{}@{}", t.user.as_deref().unwrap_or("?"), t.host);
-            ssh::spawn(runtime.handle(), t.clone(), config.term.clone(), event_tx, cmd_rx);
-            title
+            let first = ssh::Pane { events: event_tx, cmds: cmd_rx };
+            (title, Some(ssh::spawn(runtime.handle(), t.clone(), config.term.clone(), first)))
         }
         Err(e) => {
             let _ = event_tx.send(ssh::Event::Closed(format!(
                 "{e}\n사용법: termhop-next [-l 사용자] [-pw 비밀번호] [-P 포트] [사용자@]서버주소"
             )));
-            "termhop".to_string()
+            ("termhop".to_string(), None)
         }
     };
 
@@ -59,13 +60,11 @@ fn main() {
         let bounds = Bounds::centered(None, size(px(900.0), px(560.0)), cx);
         let options = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
-            titlebar: Some(TitlebarOptions { title: Some(title.into()), ..Default::default() }),
+            titlebar: Some(TitlebarOptions { title: Some(title.clone().into()), ..Default::default() }),
             ..Default::default()
         };
         cx.open_window(options, |window, cx| {
-            let view = cx.new(|cx| term::TermView::new(window, cx, event_rx, cmd_tx, &config));
-            window.focus(&view.focus_handle(cx));
-            view
+            cx.new(|cx| workspace::Workspace::new(window, cx, conn, event_rx, cmd_tx, config, title))
         })
         .expect("open window");
         cx.activate(true);
