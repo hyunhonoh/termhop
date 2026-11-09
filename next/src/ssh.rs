@@ -128,14 +128,7 @@ async fn run_shell(
         }
     };
 
-    let channel = handle.channel_open_session().await.map_err(|e| {
-        if extra {
-            // sshd with MaxSessions 1, or a gateway that passes one session through.
-            format!("이 연결에서 셸을 하나 더 열지 못했습니다. 서버가 연결 하나에 셸 하나만 허용하는 것 같습니다 ({e}).")
-        } else {
-            format!("셸 채널을 열지 못했습니다: {e}")
-        }
-    })?;
+    let channel = handle.channel_open_session().await.map_err(|e| format!("셸 채널을 열지 못했습니다: {e}"))?;
     channel
         .request_pty(false, term, size.cols.into(), size.rows.into(), size.width_px, size.height_px, &[])
         .await
@@ -169,16 +162,13 @@ async fn run_shell(
     let mut exit_status = None;
     let mut to_writer = Some(to_writer);
     // Some servers (paramiko-based gateways among them) say yes to a second shell
-    // but only ever serve the first. Say so instead of leaving an empty pane.
+    // but only ever serve the first; don't leave an empty pane waiting forever.
     let silence = tokio::time::sleep(std::time::Duration::from_secs(5));
     tokio::pin!(silence);
     let mut heard = !extra;
     loop {
         tokio::select! {
-            () = &mut silence, if !heard => {
-                heard = true;
-                notice(events, "5초 동안 서버에서 아무 출력이 없습니다. 서버가 연결 하나에 셸 하나만 처리하는 것 같습니다. 이 칸은 닫아도 됩니다.");
-            }
+            () = &mut silence, if !heard => return Err("셸 채널을 열지 못했습니다: 서버 응답 없음".into()),
             msg = reader.wait() => match msg {
                 Some(ChannelMsg::Data { data }) | Some(ChannelMsg::ExtendedData { data, .. }) => {
                     heard = true;
