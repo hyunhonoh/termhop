@@ -59,7 +59,13 @@ async fn session(
     let Target { host, port, user, password } = target;
     notice(events, format!("{host}:{port} 에 연결하는 중..."));
 
-    let config = Arc::new(client::Config { preferred: preferred(), ..Default::default() });
+    let config = Arc::new(client::Config {
+        preferred: preferred(),
+        // Group-exchange sizes as PuTTY asks for them (min 1024, max 8192); russh's
+        // default minimum of 3072 fails on servers whose moduli stop at 2048 or 1024.
+        gex: client::GexParams::new(1024, 4096, 8192).map_err(|e| e.to_string())?,
+        ..Default::default()
+    });
     let handler = Client { host: host.clone(), port, events: events.clone() };
     let mut handle = client::connect(config, (host.as_str(), port), handler)
         .await
@@ -241,7 +247,11 @@ fn preferred() -> Preferred {
     let mut macs = defaults.mac.to_vec();
     macs.extend([mac::HMAC_SHA1_ETM, mac::HMAC_SHA1]);
 
-    Preferred { kex: kex_list.into(), cipher: ciphers.into(), mac: macs.into(), ..defaults }
+    // ssh-dss host keys, for servers that have no other kind.
+    let mut host_keys = defaults.key.to_vec();
+    host_keys.push(keys::Algorithm::Dsa);
+
+    Preferred { kex: kex_list.into(), key: host_keys.into(), cipher: ciphers.into(), mac: macs.into(), ..defaults }
 }
 
 struct Client {
@@ -321,5 +331,6 @@ mod tests {
         assert!(modern < g1 && g1 < ext);
         assert_eq!(p.cipher.last().map(|c| c.as_ref()), Some("3des-cbc"));
         assert_eq!(p.mac.last().map(|m| m.as_ref()), Some("hmac-sha1"));
+        assert_eq!(p.key.last(), Some(&keys::Algorithm::Dsa));
     }
 }

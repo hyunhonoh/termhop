@@ -21,7 +21,7 @@ fn main() {
     let raw: Vec<String> = std::env::args().skip(1).collect();
     let target = args::parse(&raw);
 
-    let (config, config_problem) = config::Config::load();
+    let (config, config_problems) = config::Config::load();
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
@@ -31,7 +31,7 @@ fn main() {
 
     let (event_tx, event_rx) = mpsc::unbounded_channel();
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
-    if let Some(problem) = config_problem {
+    for problem in config_problems {
         let _ = event_tx.send(ssh::Event::Notice(problem));
     }
     let title = match &target {

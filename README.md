@@ -24,7 +24,7 @@ termhop-next는 이 중간 단계를 없앤 **창 하나짜리 SSH 터미널**�
 
 | 역할 | 선택 | 이유 |
 |---|---|---|
-| SSH | [russh](https://github.com/warp-tech/russh) | 순수 Rust. 최신 알고리즘을 먼저 쓰고, 오래된 서버용 알고리즘(DH group1/14/GEX-SHA1, CBC, HMAC-SHA1)을 가장 낮은 우선순위로 붙임 |
+| SSH | [russh](https://github.com/warp-tech/russh) | 순수 Rust. 최신 알고리즘을 먼저 쓰고, 오래된 서버용 알고리즘(DH group1/14/GEX-SHA1, CBC, HMAC-SHA1, ssh-dss 호스트 키)을 가장 낮은 우선순위로 붙임. DH 그룹 교환 크기는 PuTTY와 같은 1024~8192비트로 요청(`next/vendor/russh`, 한 줄 수정) |
 | 터미널 상태 | [libghostty-vt](https://github.com/ghostty-org/ghostty) ([Rust 바인딩](https://github.com/uzaaft/libghostty-rs)) | Ghostty의 터미널 엔진. 제어 코드 해석, 스크롤백, 키 인코딩, 선택, OSC 52까지 처리 |
 | 화면 | [GPUI](https://www.gpui.rs/) (Zed) | GPU로 그리는 Rust UI. 한글 등 IME 조합 입력 지원 |
 
@@ -91,25 +91,38 @@ termhop-next.exe -l 사용자 -pw 비밀번호 -P 22 서버주소
 `termhop-next.exe`와 같은 폴더, 또는 `%APPDATA%\termhop\`에 `next.conf`를 **UTF-8**로 저장합니다.
 1단계의 `termhop.conf`와는 다른 파일입니다. 모든 항목은 생략할 수 있습니다.
 
+**Ghostty 설정을 그대로 쓸 수 있습니다.** Ghostty의 `config` 파일 내용을 `next.conf`에 붙여 넣으면
+글꼴·크기·색·테마를 읽고, 창·단축키 같은 나머지 항목은 건너뜁니다.
+
 ```ini
-# 글꼴과 크기
-font = Consolas
-font_size = 14
+# 테마 (Ghostty 테마 이름. light:이름,dark:이름 이면 dark를 씀)
+theme = Catppuccin Frappe
+
+# 글꼴과 크기 (font-family / font-size 도 됨)
+font-family = JetBrainsMonoHangulNL Nerd Font Mono
+font-size = 16
 
 # 서버에 알리는 터미널 종류 (기본 xterm, PuTTY와 같음)
-# term = xterm-256color
+term = xterm-256color
 
-# 스크롤백 줄 수
+# 스크롤백 줄 수 (기본 10000)
 scrollback = 10000
 
-# 색 (#rrggbb)
-foreground = #d4d4d4
-background = #1e1e1e
-cursor = #e8e8e8
+# 색을 직접 정하면 테마보다 우선
+# background = #303446
+# foreground = #c6d0f5
+# cursor-color = #f2d5cf
+# cursor-text = #303446
+# selection-background = #f2d5cf
+# selection-foreground = #303446
+# palette = 1=#e78284
 ```
 
-값이 잘못되면 창 첫 줄에 어느 줄이 문제인지 표시하고 기본 설정으로 엽니다.
-서버 키 기록(`known_hosts`)도 같은 `%APPDATA%\termhop\` 폴더에 저장됩니다.
+- **테마**: `Catppuccin Mocha / Macchiato / Frappe / Latte`는 내장돼 있습니다. 다른 Ghostty 테마는 Mac의
+  `/Applications/Ghostty.app/Contents/Resources/ghostty/themes/`에서 파일을 복사해 `next.conf` 옆 `themes` 폴더에 넣으면 됩니다.
+- **글꼴**: Windows에 설치된 글꼴만 쓸 수 있습니다. 없으면 창 첫 줄에 알리고 Consolas로 엽니다.
+- 잘못된 줄은 창 첫 줄에 몇 번째 줄인지 표시하고 건너뜁니다.
+- 서버 키 기록(`known_hosts`)도 같은 `%APPDATA%\termhop\` 폴더에 저장됩니다.
 
 ## 아직 없는 것
 

@@ -19,7 +19,7 @@ use libghostty_vt::paste;
 use libghostty_vt::render::{CellIterator, CursorVisualStyle, RenderState, RowIterator};
 use libghostty_vt::screen::{CellWide, Screen};
 use libghostty_vt::selection::{FormatOptions, Selection};
-use libghostty_vt::style::{RgbColor, Underline};
+use libghostty_vt::style::{PaletteIndex, RgbColor, Underline};
 use libghostty_vt::terminal::{ClipboardMime, Point as GridPoint, PointCoordinate, ScrollViewport};
 use libghostty_vt::Terminal;
 use tokio::sync::{mpsc, oneshot};
@@ -57,6 +57,8 @@ pub struct TermView {
     font: Font,
     font_size: Pixels,
     background: RgbColor,
+    cursor_text: Option<RgbColor>,
+    selection: Option<(RgbColor, Option<RgbColor>)>,
     size: Option<Size>,
     /// IME composition text, drawn at the cursor until committed.
     preedit: Option<String>,
@@ -93,6 +95,13 @@ impl TermView {
             .and_then(|t| t.set_default_bg_color(Some(config.background)))
             .and_then(|t| t.set_default_cursor_color(Some(config.cursor)))
             .expect("colors");
+        if !config.palette.is_empty() {
+            let mut palette = term.default_color_palette().expect("palette");
+            for &(index, color) in &config.palette {
+                palette.set(PaletteIndex(index), color);
+            }
+            term.set_default_color_palette(Some(palette)).expect("palette");
+        }
         term.on_pty_write({
             let replies = replies.clone();
             move |_, data| replies.borrow_mut().extend_from_slice(data)
@@ -120,6 +129,8 @@ impl TermView {
             })
         })
         .expect("callbacks");
+
+        let family = font_family(window, &config.font, &mut term);
 
         cx.spawn_in(window, async move |this, cx| {
             while let Some(first) = events.recv().await {
@@ -159,9 +170,11 @@ impl TermView {
             title_changed,
             cmds,
             mode: Mode::Session,
-            font: Font { family: config.font.clone().into(), ..gpui::font("") },
+            font: Font { family: family.into(), ..gpui::font("") },
             font_size: px(config.font_size),
             background: config.background,
+            cursor_text: config.cursor_text,
+            selection: config.selection_background.map(|bg| (bg, config.selection_foreground)),
             size: None,
             preedit: None,
             cursor_bounds: None,
@@ -524,9 +537,17 @@ impl TermView {
                     }
                 }
                 if cell.is_selected().unwrap_or(false) {
-                    let back = bg.unwrap_or(colors.background);
-                    bg = Some(look.fg);
-                    look.fg = back;
+                    match self.selection {
+                        Some((sel_bg, sel_fg)) => {
+                            bg = Some(sel_bg);
+                            look.fg = sel_fg.unwrap_or(look.fg);
+                        }
+                        None => {
+                            let back = bg.unwrap_or(colors.background);
+                            bg = Some(look.fg);
+                            look.fg = back;
+                        }
+                    }
                 }
                 if let Some(bg) = bg {
                     match frame.backgrounds.last_mut() {
@@ -542,7 +563,8 @@ impl TermView {
                     && !look.invisible;
                 let cells_wide = if wide == CellWide::Wide { 2 } else { 1 };
                 if frame.cursor == Some((x, y)) {
-                    frame.cursor_cell = Some(CursorCell { text: has_text.then(|| text.clone()), cols: cells_wide, look, back: bg.unwrap_or(colors.background) });
+                    let back = self.cursor_text.unwrap_or(bg.unwrap_or(colors.background));
+                    frame.cursor_cell = Some(CursorCell { text: has_text.then(|| text.clone()), cols: cells_wide, look, back });
                 }
                 if !has_text {
                     flush(&mut run, &mut frame.texts);
@@ -572,6 +594,18 @@ impl TermView {
         }
         Some(frame)
     }
+}
+
+/// The configured font if it is installed; otherwise say so and use the default.
+fn font_family(window: &Window, wanted: &str, term: &mut Terminal<'static, 'static>) -> String {
+    let installed = window.text_system().all_font_names();
+    if installed.iter().any(|name| name.eq_ignore_ascii_case(wanted)) {
+        return wanted.to_string();
+    }
+    let fallback = crate::config::default_font();
+    let notice = format!("\x1b[2m[termhop] 글꼴 `{wanted}`이(가) 설치되어 있지 않아 {fallback}(으)로 엽니다.\x1b[0m\r\n");
+    term.vt_write(notice.as_bytes());
+    fallback.to_string()
 }
 
 fn flush(run: &mut Option<TextSeg>, out: &mut Vec<TextSeg>) {
