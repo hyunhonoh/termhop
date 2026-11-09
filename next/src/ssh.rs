@@ -64,9 +64,12 @@ async fn session(
         // Group-exchange sizes as PuTTY asks for them (min 1024, max 8192); russh's
         // default minimum of 3072 fails on servers whose moduli stop at 2048 or 1024.
         gex: client::GexParams::new(1024, 4096, 8192).map_err(|e| e.to_string())?,
+        // What the server logs as the client (PuTTY sends "PuTTY_Release_0.83").
+        // No '-' allowed in this part of the version line.
+        client_id: russh::SshId::Standard(format!("SSH-2.0-termhop_{}", env!("CARGO_PKG_VERSION").replace('-', ".")).into()),
         ..Default::default()
     });
-    let handler = Client { host: host.clone(), port, events: events.clone() };
+    let handler = Client { host: host.clone(), port, events: events.clone(), reported: false };
     let mut handle = client::connect(config, (host.as_str(), port), handler)
         .await
         .map_err(|e| format!("연결하지 못했습니다: {e}"))?;
@@ -258,10 +261,31 @@ struct Client {
     host: String,
     port: u16,
     events: Events,
+    /// The negotiated algorithms were shown (only for the first key exchange).
+    reported: bool,
 }
 
 impl client::Handler for Client {
     type Error = russh::Error;
+
+    // Like PuTTY's event log: which algorithms this connection ended up with.
+    async fn kex_done(
+        &mut self,
+        _shared_secret: Option<&[u8]>,
+        names: &russh::Names,
+        _session: &mut client::Session,
+    ) -> Result<(), Self::Error> {
+        if !std::mem::replace(&mut self.reported, true) {
+            let kex: &str = names.kex.as_ref();
+            let cipher: &str = names.cipher.as_ref();
+            let mac: &str = names.client_mac.as_ref();
+            notice(
+                &self.events,
+                format!("키 교환 {kex} · 서버 키 {} · 암호화 {cipher} · MAC {mac}", names.key),
+            );
+        }
+        Ok(())
+    }
 
     async fn check_server_key(&mut self, key: &PublicKeyOrCertificate) -> Result<bool, Self::Error> {
         let PublicKeyOrCertificate::PublicKey { key, .. } = key else {
