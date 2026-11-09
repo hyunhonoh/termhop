@@ -64,9 +64,6 @@ async fn session(
         // Group-exchange sizes as PuTTY asks for them (min 1024, max 8192); russh's
         // default minimum of 3072 fails on servers whose moduli stop at 2048 or 1024.
         gex: client::GexParams::new(1024, 4096, 8192).map_err(|e| e.to_string())?,
-        // What the server logs as the client (PuTTY sends "PuTTY_Release_0.83").
-        // No '-' allowed in this part of the version line.
-        client_id: russh::SshId::Standard(format!("SSH-2.0-termhop_{}", env!("CARGO_PKG_VERSION").replace('-', ".")).into()),
         ..Default::default()
     });
     let handler = Client { host: host.clone(), port, events: events.clone(), reported: false };
