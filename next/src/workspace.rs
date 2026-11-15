@@ -5,7 +5,7 @@ use std::collections::HashMap;
 
 use gpui::{
     div, prelude::*, px, AnyElement, Axis, Context, Entity, EntityId, FocusHandle, Focusable, Hsla, KeyDownEvent,
-    Keystroke, MouseButton, Render, Subscription, Window,
+    Keystroke, MouseButton, PromptButton, PromptLevel, Render, Subscription, Window,
 };
 use tokio::sync::mpsc;
 
@@ -17,6 +17,8 @@ pub struct Workspace {
     /// None when the command line was wrong: there is nothing to open more shells on.
     conn: Option<Connection>,
     config: Config,
+    /// The font size from the settings, which Ctrl+0 goes back to.
+    font_size: f32,
     /// `user@host`, for tabs and the window while the program hasn't set a title.
     name: String,
     tabs: Vec<Tab>,
@@ -85,9 +87,18 @@ impl Node {
         }
     }
 
-    fn render(&self, divider: Hsla) -> AnyElement {
+    /// `shade` covers every pane but `focused`, so it is plain where typing goes.
+    fn render(&self, divider: Hsla, focused: EntityId, shade: Option<Hsla>) -> AnyElement {
         match self {
-            Node::Pane(view) => div().flex().flex_1().min_w_0().min_h_0().child(view.clone()).into_any_element(),
+            Node::Pane(view) => div()
+                .relative()
+                .flex()
+                .flex_1()
+                .min_w_0()
+                .min_h_0()
+                .child(view.clone())
+                .children(shade.filter(|_| view.entity_id() != focused).map(|c| div().absolute().inset_0().bg(c)))
+                .into_any_element(),
             Node::Split { axis, first, second } => {
                 let (outer, line) = match axis {
                     Axis::Horizontal => (div().flex_row(), div().w(px(1.0))),
@@ -98,9 +109,9 @@ impl Node {
                     .flex_1()
                     .min_w_0()
                     .min_h_0()
-                    .child(first.render(divider))
+                    .child(first.render(divider, focused, shade))
                     .child(line.flex_none().bg(divider))
-                    .child(second.render(divider))
+                    .child(second.render(divider, focused, shade))
                     .into_any_element()
             }
         }
@@ -116,6 +127,8 @@ enum Action {
     PrevTab,
     GoToTab(usize),
     Focus(Direction),
+    /// Font size up or down a point; 0 puts it back.
+    Zoom(i8),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -137,7 +150,11 @@ impl Workspace {
         name: String,
     ) -> Self {
         let mut this =
-            Workspace { conn, config, name, tabs: Vec::new(), active: 0, subscriptions: HashMap::new() };
+            Workspace { conn, font_size: config.font_size, config, name, tabs: Vec::new(), active: 0, subscriptions: HashMap::new() };
+        let weak = cx.weak_entity();
+        window.on_window_should_close(cx, move |window, cx| {
+            weak.update(cx, |this, cx| this.should_close(window, cx)).unwrap_or(true)
+        });
         let first = this.add_pane(events, cmds, window, cx);
         this.tabs.push(Tab { root: Node::Pane(first.clone()), focused: first.clone() });
         window.focus(&first.focus_handle(cx));
@@ -207,12 +224,21 @@ impl Workspace {
                     Action::NextTab => (self.active + 1) % n,
                     Action::PrevTab => (self.active + n - 1) % n,
                     Action::GoToTab(i) if i < n => i,
-                    _ => return true,
+                    // No such tab: the key belongs to the program.
+                    _ => return false,
                 };
                 self.select_tab(to, window, cx);
             }
-            // With a single pane, Alt+arrow belongs to the program.
+            // With no pane that way, Alt+arrow belongs to the program.
             Action::Focus(dir) => return self.move_focus(dir, window, cx),
+            Action::Zoom(steps) => {
+                // Kept in the config so panes opened later match.
+                let size = if steps == 0 { self.font_size } else { (self.config.font_size + steps as f32).clamp(6.0, 72.0) };
+                self.config.font_size = size;
+                for view in self.panes() {
+                    view.update(cx, |view, cx| view.set_font_size(size, cx));
+                }
+            }
         }
         cx.notify();
         true
@@ -230,11 +256,13 @@ impl Workspace {
         // Dropping the view drops its command channel, which closes that shell.
         self.subscriptions.remove(&id);
         let tab = self.tabs.remove(index);
+        let mut before = Vec::new();
+        tab.root.panes(&mut before);
+        let at = before.iter().position(|v| v.entity_id() == id).unwrap_or(0);
         if let Some(root) = tab.root.remove(id) {
             let focused = if tab.focused.entity_id() == id {
-                let mut panes = Vec::new();
-                root.panes(&mut panes);
-                panes.swap_remove(0)
+                // The neighbor it was split from, not the far corner of the tab.
+                before.swap_remove(if at > 0 { at - 1 } else { 1 })
             } else {
                 tab.focused
             };
@@ -252,9 +280,55 @@ impl Workspace {
     fn close_tab(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         let mut panes = Vec::new();
         self.tabs[index].root.panes(&mut panes);
-        for view in panes {
-            self.close_pane(view.entity_id(), window, cx);
+        let live = panes.iter().filter(|v| v.read(cx).is_live()).count();
+        let close = move |this: &mut Self, window: &mut Window, cx: &mut Context<Self>| {
+            for view in panes {
+                this.close_pane(view.entity_id(), window, cx);
+            }
+        };
+        if live > 1 {
+            self.confirm(&format!("이 탭의 셸 {live}개를 닫을까요?"), window, cx, close);
+        } else {
+            close(self, window, cx);
         }
+    }
+
+    fn panes(&self) -> Vec<Entity<TermView>> {
+        let mut panes = Vec::new();
+        for tab in &self.tabs {
+            tab.root.panes(&mut panes);
+        }
+        panes
+    }
+
+    /// The window's close button, Alt+F4: one stray click shouldn't end several shells.
+    fn should_close(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let live = self.panes().iter().filter(|v| v.read(cx).is_live()).count();
+        if live < 2 {
+            return true;
+        }
+        self.confirm(&format!("셸 {live}개가 열려 있습니다. 창을 닫을까요?"), window, cx, |_, window, _| {
+            window.remove_window()
+        });
+        false
+    }
+
+    fn confirm(
+        &mut self,
+        question: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        then: impl FnOnce(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+    ) {
+        // Cancel comes first: it is what Enter and Esc choose.
+        let buttons = [PromptButton::Cancel("취소".into()), PromptButton::Other("닫기".into())];
+        let answer = window.prompt(PromptLevel::Warning, question, None, &buttons, cx);
+        cx.spawn_in(window, async move |this, cx| {
+            if answer.await == Ok(1) {
+                let _ = this.update_in(cx, then);
+            }
+        })
+        .detach();
     }
 
     /// Focus the nearest pane in that direction, judged from where the panes were drawn.
@@ -284,9 +358,8 @@ impl Workspace {
                 dist(a).total_cmp(&dist(b))
             })
             .map(|(view, _)| view.clone());
-        if let Some(view) = target {
-            window.focus(&view.focus_handle(cx));
-        }
+        let Some(view) = target else { return false };
+        window.focus(&view.focus_handle(cx));
         true
     }
 
@@ -366,6 +439,13 @@ impl Workspace {
     }
 }
 
+/// The keys nobody would guess, for the first line of a new window.
+pub const HINT: &str = if cfg!(target_os = "macos") {
+    "새 탭 Cmd+T · 분할 Cmd+D, Cmd+Shift+D · 칸 닫기 Cmd+W"
+} else {
+    "새 탭 Ctrl+Shift+T · 분할 Alt+Shift+=, Alt+Shift+- · 칸 닫기 Ctrl+Shift+W"
+};
+
 /// Window Terminal's keys on Windows, Ghostty's on macOS.
 fn shortcut(ks: &Keystroke) -> Option<Action> {
     let m = &ks.modifiers;
@@ -373,6 +453,12 @@ fn shortcut(ks: &Keystroke) -> Option<Action> {
     if m.control && !m.alt && !m.platform && key == "tab" {
         return Some(if m.shift { Action::PrevTab } else { Action::NextTab });
     }
+    let zoom = || match key {
+        "=" | "+" => Some(Action::Zoom(1)),
+        "-" => Some(Action::Zoom(-1)),
+        "0" => Some(Action::Zoom(0)),
+        _ => None,
+    };
     let digit = || key.parse::<usize>().ok().filter(|d| (1..=9).contains(d)).map(|d| Action::GoToTab(d - 1));
     let arrow = || {
         Some(Action::Focus(match key {
@@ -392,7 +478,7 @@ fn shortcut(ks: &Keystroke) -> Option<Action> {
                 "t" => Some(Action::NewTab),
                 "d" => Some(Action::Split(Axis::Horizontal)),
                 "w" => Some(Action::ClosePane),
-                _ => digit(),
+                _ => zoom().or_else(digit),
             },
             (true, false) => match key {
                 "d" => Some(Action::Split(Axis::Vertical)),
@@ -420,6 +506,7 @@ fn shortcut(ks: &Keystroke) -> Option<Action> {
             },
             (false, false, true) => arrow(),
             (true, false, true) => digit(),
+            (true, false, false) => zoom(),
             _ => None,
         }
     }
@@ -434,6 +521,9 @@ impl Focusable for Workspace {
 impl Render for Workspace {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let divider = Hsla { a: 0.3, ..hsla(self.config.foreground) };
+        let tab = &self.tabs[self.active];
+        // Only a split tab needs telling which pane is typed into.
+        let shade = matches!(tab.root, Node::Split { .. }).then(|| Hsla { a: 0.3, ..hsla(self.config.background) });
         div()
             .size_full()
             .flex()
@@ -442,7 +532,7 @@ impl Render for Workspace {
             .capture_key_down(cx.listener(Self::key_down))
             // One tab looks like a plain terminal window; the bar appears with the second.
             .when(self.tabs.len() > 1, |d| d.child(self.tab_bar(cx)))
-            .child(div().flex().flex_1().min_h_0().child(self.tabs[self.active].root.render(divider)))
+            .child(div().flex().flex_1().min_h_0().child(tab.root.render(divider, tab.focused.entity_id(), shade)))
     }
 }
 
@@ -467,11 +557,16 @@ mod tests {
             assert_eq!(shortcut(&keystroke(key, ctrl, alt, shift, false)), None, "{key}");
         }
         if cfg!(target_os = "macos") {
+            assert_eq!(shortcut(&keystroke("=", false, false, false, true)), Some(Action::Zoom(1)));
+            assert_eq!(shortcut(&keystroke("0", false, false, false, true)), Some(Action::Zoom(0)));
             assert_eq!(shortcut(&keystroke("t", false, false, false, true)), Some(Action::NewTab));
             assert_eq!(shortcut(&keystroke("d", false, false, true, true)), Some(Action::Split(Axis::Vertical)));
             assert_eq!(shortcut(&keystroke("2", false, false, false, true)), Some(Action::GoToTab(1)));
             assert_eq!(shortcut(&keystroke("left", false, true, false, true)), Some(Action::Focus(Direction::Left)));
         } else {
+            assert_eq!(shortcut(&keystroke("-", true, false, false, false)), Some(Action::Zoom(-1)));
+            // Ctrl+_ (undo in readline) is Ctrl+Shift+-.
+            assert_eq!(shortcut(&keystroke("_", true, false, true, false)), None);
             assert_eq!(shortcut(&keystroke("t", true, false, true, false)), Some(Action::NewTab));
             assert_eq!(shortcut(&keystroke("-", false, true, true, false)), Some(Action::Split(Axis::Vertical)));
             assert_eq!(shortcut(&keystroke("left", false, true, false, false)), Some(Action::Focus(Direction::Left)));

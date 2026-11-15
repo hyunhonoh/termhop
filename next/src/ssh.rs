@@ -31,7 +31,10 @@ pub enum Event {
     Notice(String),
     /// Ask the user for a line of input. `None` means they cancelled.
     Prompt { text: String, echo: bool, reply: oneshot::Sender<Option<String>> },
+    /// The shell is gone and the pane stays to show why.
     Closed(String),
+    /// The shell ended on its own (`exit`); the pane closes with it.
+    Exited,
 }
 
 type Events = mpsc::UnboundedSender<Event>;
@@ -64,14 +67,28 @@ pub fn spawn(rt: &tokio::runtime::Handle, target: Target, term: String, first: P
             Ok(handle) => Arc::new(handle),
             Err(reason) => {
                 let _ = first.events.send(Event::Closed(reason));
+                // Tabs opened while logging in have nothing to run on.
+                more.close();
+                while let Some(pane) = more.recv().await {
+                    let _ = pane.events.send(Event::Closed("로그인하지 못해 셸을 열 수 없습니다.".into()));
+                }
                 return;
             }
         };
         let term: Arc<str> = term.into();
-        tokio::spawn(shell(handle.clone(), term.clone(), first, false));
+        // Keys typed between the login questions (a password retyped too early)
+        // must not reach the shell. Only the pane's size is kept.
+        let Pane { events, mut cmds } = first;
+        let mut size = None;
+        while let Ok(cmd) = cmds.try_recv() {
+            if let Cmd::Resize(s) = cmd {
+                size = Some(s);
+            }
+        }
+        tokio::spawn(shell(handle.clone(), term.clone(), Pane { events, cmds }, size, false));
         // Panes asked for while logging in waited in the channel; they open now.
         while let Some(pane) = more.recv().await {
-            tokio::spawn(shell(handle.clone(), term.clone(), pane, true));
+            tokio::spawn(shell(handle.clone(), term.clone(), pane, None, true));
         }
         let _ = handle.disconnect(Disconnect::ByApplication, "", "").await;
     });
@@ -87,6 +104,9 @@ async fn connect(target: Target, events: &Events) -> Result<client::Handle<Clien
         // Group-exchange sizes as PuTTY asks for them (min 1024, max 8192); russh's
         // default minimum of 3072 fails on servers whose moduli stop at 2048 or 1024.
         gex: client::GexParams::new(1024, 4096, 8192).map_err(|e| e.to_string())?,
+        // Keeps idle sessions from being dropped by firewalls, and notices a dead
+        // connection (sleep, VPN) after three unanswered probes.
+        keepalive_interval: Some(std::time::Duration::from_secs(30)),
         ..Default::default()
     });
     let handler = Client { host: host.clone(), port, events: events.clone(), reported: false };
@@ -103,29 +123,42 @@ async fn connect(target: Target, events: &Events) -> Result<client::Handle<Clien
 }
 
 /// One shell in its own session channel, until it exits or its pane closes.
-/// `extra` is any shell after the first, which some servers refuse.
-async fn shell(handle: Arc<client::Handle<Client>>, term: Arc<str>, pane: Pane, extra: bool) {
+/// `size` is the pane's size when already known. `extra` is any shell after the
+/// first, which some servers refuse.
+async fn shell(handle: Arc<client::Handle<Client>>, term: Arc<str>, pane: Pane, size: Option<Size>, extra: bool) {
     let Pane { events, cmds } = pane;
-    let reason = run_shell(&handle, &term, &events, cmds, extra).await.unwrap_or_else(|e| e);
-    let _ = events.send(Event::Closed(reason));
+    let _ = events.send(match run_shell(&handle, &term, &events, cmds, size, extra).await {
+        Ok(None) => Event::Exited,
+        Ok(Some(reason)) | Err(reason) => Event::Closed(reason),
+    });
 }
+
+/// A shell that ends this soon after starting probably had something to say
+/// (an expired account, a failing profile), so its pane stays open.
+const BRIEF: std::time::Duration = std::time::Duration::from_secs(5);
+/// How long a shell after the first may stay silent before it counts as not served.
+const SILENCE: std::time::Duration = std::time::Duration::from_secs(10);
 
 async fn run_shell(
     handle: &client::Handle<Client>,
     term: &str,
     events: &Events,
     mut cmds: mpsc::UnboundedReceiver<Cmd>,
+    size: Option<Size>,
     extra: bool,
-) -> Result<String, String> {
+) -> Result<Option<String>, String> {
     // The pty is sized from the pane, so wait for its first layout.
     // Keystrokes typed in the meantime are replayed once the shell is up.
     let mut early_input = Vec::new();
-    let size = loop {
-        match cmds.recv().await {
-            Some(Cmd::Resize(size)) => break size,
-            Some(Cmd::Input(bytes)) => early_input.extend(bytes),
-            None => return Ok(String::new()),
-        }
+    let size = match size {
+        Some(size) => size,
+        None => loop {
+            match cmds.recv().await {
+                Some(Cmd::Resize(size)) => break size,
+                Some(Cmd::Input(bytes)) => early_input.extend(bytes),
+                None => return Ok(None),
+            }
+        },
     };
 
     let channel = handle.channel_open_session().await.map_err(|e| format!("셸 채널을 열지 못했습니다: {e}"))?;
@@ -159,23 +192,50 @@ async fn run_shell(
         let _ = to_writer.send(Cmd::Input(early_input));
     }
 
+    let started = std::time::Instant::now();
     let mut exit_status = None;
+    // The server ended the shell itself, as opposed to the connection going away.
+    let mut ended = false;
     let mut to_writer = Some(to_writer);
     // Some servers (paramiko-based gateways among them) say yes to a second shell
     // but only ever serve the first; don't leave an empty pane waiting forever.
-    let silence = tokio::time::sleep(std::time::Duration::from_secs(5));
+    let silence = tokio::time::sleep(SILENCE);
     tokio::pin!(silence);
-    let mut heard = !extra;
+    let mut heard = false;
     loop {
         tokio::select! {
-            () = &mut silence, if !heard => return Err("셸 채널을 열지 못했습니다: 서버 응답 없음".into()),
+            () = &mut silence, if extra && !heard => return Err("셸 채널을 열지 못했습니다: 서버 응답 없음".into()),
             msg = reader.wait() => match msg {
                 Some(ChannelMsg::Data { data }) | Some(ChannelMsg::ExtendedData { data, .. }) => {
                     heard = true;
                     let _ = events.send(Event::Output(data.to_vec()));
                 }
-                Some(ChannelMsg::ExitStatus { exit_status: code }) => exit_status = Some(code),
-                Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) | None => break,
+                // The answer to the shell request.
+                Some(ChannelMsg::Failure) if !heard => return Err("셸을 시작하지 못했습니다: 서버가 거절했습니다".into()),
+                Some(ChannelMsg::ExitStatus { exit_status: code }) => {
+                    exit_status = Some(code);
+                    ended = true;
+                }
+                Some(ChannelMsg::Eof) => {
+                    ended = true;
+                    // The exit status may come after the end of output; give it a moment.
+                    let rest = async {
+                        while let Some(msg) = reader.wait().await {
+                            match msg {
+                                ChannelMsg::ExitStatus { exit_status: code } => exit_status = Some(code),
+                                ChannelMsg::Close => break,
+                                _ => {}
+                            }
+                        }
+                    };
+                    let _ = tokio::time::timeout(std::time::Duration::from_secs(1), rest).await;
+                    break;
+                }
+                Some(ChannelMsg::Close) => {
+                    ended = true;
+                    break;
+                }
+                None => break,
                 _ => {}
             },
             cmd = cmds.recv(), if to_writer.is_some() => match cmd {
@@ -189,10 +249,16 @@ async fn run_shell(
             },
         }
     }
-    Ok(match exit_status {
+    if !ended {
+        return Err("연결이 끊겼습니다.".into());
+    }
+    if started.elapsed() > BRIEF {
+        return Ok(None);
+    }
+    Ok(Some(match exit_status {
         Some(code) => format!("세션이 끝났습니다 (종료 코드 {code})."),
         None => "세션이 끝났습니다.".into(),
-    })
+    }))
 }
 
 /// Password first (what `-pw` means in PuTTY), then whatever the server says it
@@ -204,6 +270,7 @@ async fn authenticate(
     password: Option<String>,
     events: &Events,
 ) -> Result<(), String> {
+    let mut accepted = false;
     let failed = |e: russh::Error| format!("로그인 중 오류: {e}");
     // Empty means "not told yet": try keyboard-interactive, then password.
     let mut allowed: Vec<MethodKind> = Vec::new();
@@ -211,10 +278,14 @@ async fn authenticate(
     if let Some(pw) = &password {
         match handle.authenticate_password(user, pw).await.map_err(failed)? {
             AuthResult::Success => return Ok(()),
-            AuthResult::Failure { remaining_methods, .. } => {
+            AuthResult::Failure { remaining_methods, partial_success } => {
                 allowed = remaining_methods.to_vec();
-                // Keyboard-interactive will still try the same password; only say so when it won't.
-                if !allowed.contains(&MethodKind::KeyboardInteractive) {
+                if partial_success {
+                    // The server took the password and wants something more (a one-time
+                    // code, say). The password is not the answer to that question.
+                    accepted = true;
+                } else if !allowed.contains(&MethodKind::KeyboardInteractive) {
+                    // Keyboard-interactive will still try the same password; only say so when it won't.
                     notice(events, "전달받은 비밀번호(-pw)로 로그인하지 못했습니다.");
                 }
             }
@@ -222,7 +293,7 @@ async fn authenticate(
     }
 
     // The given password answers the first hidden keyboard-interactive prompt.
-    let mut unused_password = password;
+    let mut unused_password = password.filter(|_| !accepted);
     for attempt in 0..3 {
         if attempt > 0 {
             notice(events, "로그인하지 못했습니다. 다시 입력해 주세요.");

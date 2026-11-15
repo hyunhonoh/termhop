@@ -3,12 +3,24 @@
 //! Only what a launcher passes when it starts PuTTY for an SSH login is accepted.
 //! Anything else is rejected with a message instead of being silently ignored.
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Target {
     pub host: String,
     pub port: u16,
     pub user: Option<String>,
     pub password: Option<String>,
+}
+
+// The password never appears in debug output (test failures, a panic message).
+impl std::fmt::Debug for Target {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Target")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("user", &self.user)
+            .field("password", &self.password.as_ref().map(|_| "***"))
+            .finish()
+    }
 }
 
 /// Flags that only tune PuTTY/plink behavior and have no meaning here.
@@ -24,8 +36,11 @@ pub fn parse(args: &[String]) -> Result<Target, String> {
     let mut host: Option<String> = None;
 
     let mut it = args.iter();
+    let mut position = 0;
     while let Some(arg) = it.next() {
+        position += 1;
         let mut value = |name: &str| {
+            position += 1;
             it.next().cloned().ok_or_else(|| format!("{name} 다음에 값이 필요합니다."))
         };
         match arg.as_str() {
@@ -37,10 +52,15 @@ pub fn parse(args: &[String]) -> Result<Target, String> {
             }
             a if IGNORED.contains(&a) => {}
             a if a.starts_with('@') => return Err("저장된 PuTTY 세션(@이름)은 아직 지원하지 않습니다.".into()),
-            a if a.starts_with('-') && a.len() > 1 => return Err(format!("지원하지 않는 옵션입니다: {a}")),
+            // Named by position, not shown: an unquoted password with a space in it can
+            // leave a piece that looks like an option.
+            a if a.starts_with('-') && a.len() > 1 => {
+                return Err(format!("지원하지 않는 옵션입니다 ({position}번째 인자)."));
+            }
             a => {
                 if host.is_some() {
-                    return Err(format!("서버 주소 뒤의 인자는 지원하지 않습니다: {a}"));
+                    // Not shown: it can be part of a password that had a space in it.
+                    return Err("서버 주소 뒤의 인자는 지원하지 않습니다.".into());
                 }
                 host = Some(a.to_string());
             }

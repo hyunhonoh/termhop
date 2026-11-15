@@ -33,6 +33,8 @@ pub struct Config {
     pub selection_foreground: Option<RgbColor>,
     /// Palette overrides (index, color), applied over the built-in 256 colors.
     pub palette: Vec<(u8, RgbColor)>,
+    /// Show the tab and split keys in the first line of a new window.
+    pub shortcut_hint: bool,
 }
 
 impl Default for Config {
@@ -49,6 +51,7 @@ impl Default for Config {
             selection_background: None,
             selection_foreground: None,
             palette: Vec::new(),
+            shortcut_hint: true,
         }
     }
 }
@@ -221,6 +224,7 @@ fn apply(cfg: &mut Config, key: &str, value: &str) -> Result<(), String> {
         "term" if !value.is_empty() && value.is_ascii() => cfg.term = value.to_string(),
         "term" => return Err(bad(key)),
         "scrollback" => cfg.scrollback = value.parse().map_err(|_| bad(key))?,
+        "shortcut-hint" => cfg.shortcut_hint = value.parse().map_err(|_| bad("shortcut-hint (true/false)"))?,
         "foreground" => cfg.foreground = color(key)?,
         "background" => cfg.background = color(key)?,
         "cursor" | "cursor-color" => cfg.cursor = color(key)?,

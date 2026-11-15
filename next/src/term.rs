@@ -18,7 +18,7 @@ use libghostty_vt::mouse;
 use libghostty_vt::paste;
 use libghostty_vt::render::{CellIterator, CursorVisualStyle, RenderState, RowIterator};
 use libghostty_vt::screen::{CellWide, Screen};
-use libghostty_vt::selection::{FormatOptions, Selection};
+use libghostty_vt::selection::{FormatOptions, SelectLineOptions, SelectWordOptions, Selection};
 use libghostty_vt::style::{PaletteIndex, RgbColor, Underline};
 use libghostty_vt::terminal::{ClipboardMime, Point as GridPoint, PointCoordinate, ScrollViewport};
 use libghostty_vt::Terminal;
@@ -39,7 +39,7 @@ enum Mode {
 /// What a pane tells the workspace around it.
 pub enum PaneEvent {
     TitleChanged,
-    /// The session is over and the user pressed a key: remove this pane.
+    /// The session is over: remove this pane.
     Close,
 }
 
@@ -63,6 +63,7 @@ pub struct TermView {
     title_changed: Rc<Cell<bool>>,
     cmds: mpsc::UnboundedSender<Cmd>,
     mode: Mode,
+    closed_at: Option<std::time::Instant>,
     font: Font,
     font_size: Pixels,
     background: RgbColor,
@@ -180,6 +181,7 @@ impl TermView {
             title_changed,
             cmds,
             mode: Mode::Session,
+            closed_at: None,
             font: Font { family: family.into(), ..gpui::font("") },
             font_size: px(config.font_size),
             background: config.background,
@@ -213,11 +215,13 @@ impl TermView {
                 self.mode = Mode::Prompt { echo, line: String::new(), reply };
             }
             Event::Closed(reason) => {
-                if !reason.is_empty() {
-                    self.notice(&format!("{reason} 아무 키나 누르면 닫습니다."));
-                }
+                // Enter, not any key: someone in the middle of typing gets to read this.
+                self.notice(&format!("{reason} Enter를 누르면 닫습니다."));
+                self.term.scroll_viewport(ScrollViewport::Bottom);
                 self.mode = Mode::Closed;
+                self.closed_at = Some(std::time::Instant::now());
             }
+            Event::Exited => cx.emit(PaneEvent::Close),
         }
     }
 
@@ -262,7 +266,7 @@ impl TermView {
     }
 
     /// Committed text from the keyboard or IME.
-    fn type_text(&mut self, text: &str, cx: &mut Context<Self>) {
+    fn type_text(&mut self, text: &str) {
         match &mut self.mode {
             Mode::Session => self.send(text.as_bytes().to_vec()),
             Mode::Prompt { echo, line, .. } => {
@@ -272,7 +276,7 @@ impl TermView {
                     self.show(&text);
                 }
             }
-            Mode::Closed => cx.emit(PaneEvent::Close),
+            Mode::Closed => {}
         }
     }
 
@@ -290,8 +294,16 @@ impl TermView {
         }
         match &mut self.mode {
             Mode::Closed => {
-                cx.emit(PaneEvent::Close);
+                if matches!(ks.key.as_str(), "enter" | "escape") {
+                    // An Enter already on its way when the session ended doesn't count.
+                    if self.closed_at.is_none_or(|t| t.elapsed() > std::time::Duration::from_secs(1)) {
+                        cx.emit(PaneEvent::Close);
+                    }
+                } else if !self.scroll_key(ks) {
+                    return;
+                }
                 cx.stop_propagation();
+                cx.notify();
             }
             Mode::Prompt { echo, line, .. } => {
                 let echo = *echo;
@@ -310,13 +322,42 @@ impl TermView {
                 cx.notify();
             }
             Mode::Session => {
-                if let Some(bytes) = self.encode_key(ks) {
+                if self.scroll_key(ks) {
+                    cx.stop_propagation();
+                    cx.notify();
+                } else if let Some(bytes) = self.encode_key(ks) {
                     self.send(bytes);
                     cx.stop_propagation();
                     cx.notify();
                 }
             }
         }
+    }
+
+    /// Shift+PageUp/PageDown page through the scrollback, as in PuTTY.
+    /// Full-screen programs have none, so there the keys go to the program.
+    fn scroll_key(&mut self, ks: &gpui::Keystroke) -> bool {
+        let m = &ks.modifiers;
+        if !m.shift || m.control || m.alt || m.platform || self.term.active_screen().ok() != Some(Screen::Primary) {
+            return false;
+        }
+        let page = self.grid.map_or(1, |g| (g.rows as isize - 1).max(1));
+        match ks.key.as_str() {
+            "pageup" => self.term.scroll_viewport(ScrollViewport::Delta(-page)),
+            "pagedown" => self.term.scroll_viewport(ScrollViewport::Delta(page)),
+            _ => return false,
+        }
+        true
+    }
+
+    /// Whether a shell is still running here (or logging in).
+    pub fn is_live(&self) -> bool {
+        !matches!(self.mode, Mode::Closed)
+    }
+
+    pub fn set_font_size(&mut self, size: f32, cx: &mut Context<Self>) {
+        self.font_size = px(size);
+        cx.notify();
     }
 
     fn finish_prompt(&mut self, accept: bool) {
@@ -340,6 +381,9 @@ impl TermView {
                 let mimes = [ClipboardMime::new(b"text/plain")];
                 // Multi-line pastes go through as they do in PuTTY.
                 let options = paste::Options::new().with_allow_unsafe(true);
+                // Windows clipboards end lines with CR LF; sent as is, each line
+                // would be followed by an empty one.
+                let text = text.replace("\r\n", "\n");
                 let _ = self.term.paste(options, &mimes, |_, out| out.write_all(text.as_bytes()));
                 self.flush_replies();
             }
@@ -383,6 +427,18 @@ impl TermView {
         }
     }
 
+    fn select_unit(&mut self, at: PointCoordinate, word: bool) {
+        let Ok(at) = self.term.grid_ref(GridPoint::Viewport(at)) else { return };
+        let found = if word {
+            self.term.select_word(SelectWordOptions::new(at))
+        } else {
+            self.term.select_line(SelectLineOptions::new(at))
+        };
+        if let Ok(Some(selection)) = found {
+            let _ = self.term.set_selection(Some(&selection));
+        }
+    }
+
     /// Whether mouse events belong to the program (tmux, vim with mouse on) rather than
     /// to termhop's own selection. Shift always gives them back to termhop.
     fn mouse_to_program(&self, modifiers: &gpui::Modifiers) -> bool {
@@ -418,6 +474,13 @@ impl TermView {
             MouseButton::Left => {
                 let _ = self.term.set_selection(None);
                 self.selecting = self.grid_point(event.position);
+                // Double click takes the word, triple click the line, as in PuTTY.
+                if event.click_count >= 2 {
+                    if let Some(at) = self.selecting.take() {
+                        self.select_unit(at, event.click_count == 2);
+                        self.copy_selection(cx);
+                    }
+                }
             }
             MouseButton::Right => self.paste(cx),
             _ => {}
@@ -961,7 +1024,7 @@ impl EntityInputHandler for TermView {
     fn replace_text_in_range(&mut self, _: Option<Range<usize>>, text: &str, _: &mut Window, cx: &mut Context<Self>) {
         self.preedit = None;
         if !text.is_empty() {
-            self.type_text(text, cx);
+            self.type_text(text);
         }
         cx.notify();
     }

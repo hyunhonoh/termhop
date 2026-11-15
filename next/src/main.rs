@@ -37,6 +37,9 @@ fn main() {
     }
     let (title, conn) = match &target {
         Ok(t) => {
+            if config.shortcut_hint {
+                let _ = event_tx.send(ssh::Event::Notice(workspace::HINT.into()));
+            }
             let title = format!("{}@{}", t.user.as_deref().unwrap_or("?"), t.host);
             let first = ssh::Pane { events: event_tx, cmds: cmd_rx };
             (title, Some(ssh::spawn(runtime.handle(), t.clone(), config.term.clone(), first)))
